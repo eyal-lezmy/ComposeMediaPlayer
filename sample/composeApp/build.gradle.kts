@@ -121,6 +121,17 @@ compose.desktop {
                 jvmArgs(
                     "-Dapple.awt.application.appearance=system"
                 )
+                // Provide a custom Info.plist that sets NSAllowsArbitraryLoads = true
+                // so plain HTTP streams (e.g. IPTV/HLS over HTTP) are not blocked by ATS
+                infoPlist {
+                    extraKeysRawXml = """
+                        <key>NSAppTransportSecurity</key>
+                        <dict>
+                            <key>NSAllowsArbitraryLoads</key>
+                            <true/>
+                        </dict>
+                    """.trimIndent()
+                }
             }
         }
     }

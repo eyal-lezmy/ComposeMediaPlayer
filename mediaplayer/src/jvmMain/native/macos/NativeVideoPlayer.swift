@@ -3,6 +3,101 @@ import CoreGraphics
 import CoreVideo
 import Foundation
 import AppKit
+import Security
+
+// MARK: - ATS Bypass Delegate
+
+/// URLSession delegate that accepts all server trust challenges.
+/// Used together with the embedded Info.plist (NSAllowsArbitraryLoads) to allow
+/// plain HTTP and self-signed HTTPS streams from within this dylib.
+private class ATSBypassDelegate: NSObject, URLSessionDelegate {
+    func urlSession(
+        _ session: URLSession,
+        didReceive challenge: URLAuthenticationChallenge,
+        completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+    ) {
+        if challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
+           let serverTrust = challenge.protectionSpace.serverTrust {
+            completionHandler(.useCredential, URLCredential(trust: serverTrust))
+        } else {
+            completionHandler(.performDefaultHandling, nil)
+        }
+    }
+}
+
+/// Shared ATS-bypass delegate instance (retained for the life of the process).
+private let atsBypassDelegate = ATSBypassDelegate()
+
+/// Creates a URLSession configured to allow plain HTTP and bypass ATS restrictions.
+/// The embedded Info.plist in the dylib provides NSAllowsArbitraryLoads=true at the
+/// OS level; this session additionally accepts all server trust challenges.
+private func makeInsecureSession(timeout: TimeInterval = 5.0) -> URLSession {
+    let config = URLSessionConfiguration.ephemeral
+    config.timeoutIntervalForRequest = timeout
+    config.timeoutIntervalForResource = timeout
+    config.waitsForConnectivity = false
+    config.allowsConstrainedNetworkAccess = false
+    config.allowsExpensiveNetworkAccess = true
+    config.httpAdditionalHeaders = ["User-Agent": "ComposeMediaPlayer/1.0"]
+    return URLSession(configuration: config, delegate: atsBypassDelegate, delegateQueue: nil)
+}
+
+// MARK: - ATS Runtime Override
+
+/// Injects NSAllowsArbitraryLoads into the process's main bundle info dictionary.
+/// This is called once when the dylib is first loaded (via the initializer below).
+/// It allows AVFoundation (AVURLAsset, AVPlayer) and URLSession to connect to plain
+/// HTTP endpoints without an App Transport Security policy violation.
+/// This is safe because the JVM host process has no app bundle of its own.
+private func patchATSInMainBundle() {
+    let atsKey = "NSAppTransportSecurity"
+    let allowKey = "NSAllowsArbitraryLoads"
+
+    // CFBundleGetInfoDictionary gives us the CF-level info dict of the main bundle.
+    // For a JVM process this dict is typically empty/mutable, so we can inject into it.
+    guard let cfBundle = CFBundleGetMainBundle() else {
+        print("ATS patch: no main bundle found — skipping")
+        return
+    }
+
+    guard let cfDict = CFBundleGetInfoDictionary(cfBundle) else {
+        print("ATS patch: main bundle has no info dict — skipping")
+        return
+    }
+
+    // Attempt to treat it as a mutable dictionary (works for JVM processes).
+    // If the cast fails (sandboxed app), we skip gracefully rather than crashing.
+    guard let mutableDict = cfDict as? NSMutableDictionary else {
+        print("ATS patch: info dict is immutable — cannot patch ATS, relying on embedded Info.plist")
+        return
+    }
+
+    // Build or update the ATS sub-dict
+    let atsDict: NSMutableDictionary
+    if let existing = mutableDict[atsKey] as? NSMutableDictionary {
+        atsDict = existing
+    } else {
+        let newDict = NSMutableDictionary()
+        mutableDict[atsKey] = newDict
+        atsDict = newDict
+    }
+    atsDict[allowKey] = true
+    print("ATS patch: NSAllowsArbitraryLoads = true injected into main bundle info dict")
+}
+
+/// Dylib-load-time initializer — runs once when the .dylib is dlopen'd by the JVM.
+@_silgen_name("NativeVideoPlayer_init")
+public func nativeVideoPlayerLibInit() {
+    patchATSInMainBundle()
+}
+
+/// Triggers the ATS patch the first time any code in this module runs.
+/// Swift guarantees that global stored-property initializers execute exactly once,
+/// lazily, the first time the variable is accessed. We access it from the
+/// SharedVideoPlayer initializer to ensure it fires before any network call.
+private let _atsPatchOnce: Void = patchATSInMainBundle()
+
+// MARK: - SharedVideoPlayer
 
 /// Class that manages video playback and frame capture into an optimized shared buffer.
 /// Frame capture rate adapts to the lower of screen refresh rate and video frame rate.
@@ -75,6 +170,9 @@ class SharedVideoPlayer {
     private var errorCount: Int = 0
 
     init() {
+        // Ensure ATS is patched before any network call is made
+        _ = _atsPatchOnce
+
         // Detect screen refresh rate
         detectScreenRefreshRate()
 
@@ -121,20 +219,198 @@ class SharedVideoPlayer {
         }
     }
 
+    // MARK: - Xtream Codes URL parsing
+
+    /// The stream category encoded in an Xtream Codes long-form path.
+    enum XtreamCategory: String {
+        case live      = "live"
+        case movie     = "movie"
+        case series    = "series"
+        case timeshift = "timeshift"
+    }
+
+    /// Fully parsed representation of an Xtream Codes URL.
+    struct XtreamCodesURL {
+        /// Base server URL, e.g. `http://host:8080`
+        let serverURL: String
+        let username:  String
+        let password:  String
+        // Stream path fields (nil for API endpoints)
+        let streamID:        String?          // numeric stream ID e.g. "12345"
+        let category:        XtreamCategory?  // live / movie / series / timeshift
+        let streamExtension: String?          // "ts", "m3u8", nil for bare IDs
+        // API endpoint fields (nil for stream paths)
+        let apiEndpoint:  String?             // "get.php", "player_api.php", "xmltv.php"
+        let outputFormat: String?             // "hls", "ts", "m3u8", …
+
+        /// `true` when the URL explicitly requests HLS output.
+        var isExplicitlyHLS: Bool {
+            streamExtension == "m3u8" || outputFormat == "hls" || outputFormat == "m3u8"
+        }
+    }
+
+    /// Attempts to parse `url` as an Xtream Codes URL.
+    /// Returns a populated `XtreamCodesURL` on success, `nil` otherwise.
+    ///
+    /// Supported shapes (both `http` and `https`):
+    ///  - Long-form stream:  `http://host:port/live/<user>/<pass>/<id>[.ext]`
+    ///                       `http://host:port/movie/<user>/<pass>/<id>[.ext]`
+    ///                       `http://host:port/series/<user>/<pass>/<id>[.ext]`
+    ///                       `http://host:port/timeshift/<user>/<pass>/<id>[.ext]`
+    ///  - Short-form stream: `http://host:port/<user>/<pass>/<numericId>[.ext]`
+    ///  - API endpoints:     `http://host:port/get.php?username=…&password=…[&output=hls]`
+    ///                       `http://host:port/player_api.php?username=…&password=…`
+    ///                       `http://host:port/xmltv.php?username=…&password=…`
+    private func parseXtreamCodesURL(_ url: URL) -> XtreamCodesURL? {
+        guard let scheme = url.scheme?.lowercased(),
+              (scheme == "http" || scheme == "https"),
+              let host = url.host else { return nil }
+
+        var serverURL = "\(scheme)://\(host)"
+        if let port = url.port { serverURL += ":\(port)" }
+
+        // Path components, filtering the leading "/" entry URL always inserts
+        let parts    = url.pathComponents.filter { $0 != "/" }
+        let lastPart = url.lastPathComponent.lowercased()
+
+        // ── API endpoints ────────────────────────────────────────────────────────
+        let knownEndpoints = ["get.php", "player_api.php", "xmltv.php"]
+        if knownEndpoints.contains(lastPart) {
+            guard let queryItems = URLComponents(
+                url: url, resolvingAgainstBaseURL: false)?.queryItems else { return nil }
+            func param(_ name: String) -> String? {
+                queryItems.first(where: { $0.name.lowercased() == name })?.value
+            }
+            guard let username = param("username"), !username.isEmpty,
+                  let password = param("password"), !password.isEmpty else { return nil }
+            let outputFormat = param("output")?.lowercased() ?? param("type")?.lowercased()
+            return XtreamCodesURL(
+                serverURL: serverURL, username: username, password: password,
+                streamID: nil, category: nil, streamExtension: nil,
+                apiEndpoint: lastPart, outputFormat: outputFormat
+            )
+        }
+
+        // Helper: split "12345.ts" → (id: "12345", ext: "ts")
+        func splitIDAndExt(_ segment: String) -> (id: String, ext: String?) {
+            let ns  = segment as NSString
+            let ext = ns.pathExtension.lowercased()
+            return (id: ns.deletingPathExtension, ext: ext.isEmpty ? nil : ext)
+        }
+
+        // ── Long-form: /<category>/<user>/<pass>/<id>[.ext] ──────────────────────
+        if parts.count >= 4,
+           let category = XtreamCategory(rawValue: parts[0].lowercased()) {
+            let (streamID, ext) = splitIDAndExt(parts[3])
+            return XtreamCodesURL(
+                serverURL: serverURL, username: parts[1], password: parts[2],
+                streamID: streamID, category: category, streamExtension: ext,
+                apiEndpoint: nil, outputFormat: nil
+            )
+        }
+
+        // ── Short-form: /<user>/<pass>/<numericId>[.ext] ─────────────────────────
+        // Exactly 3 segments; stream ID must be numeric to avoid false positives.
+        if parts.count == 3 {
+            let (streamID, ext) = splitIDAndExt(parts[2])
+            guard streamID.allSatisfy({ $0.isNumber }), !streamID.isEmpty else { return nil }
+            return XtreamCodesURL(
+                serverURL: serverURL, username: parts[0], password: parts[1],
+                streamID: streamID, category: .live, streamExtension: ext,
+                apiEndpoint: nil, outputFormat: nil
+            )
+        }
+
+        return nil
+    }
+
     /// Checks if the URL is an HLS stream
     private func isHLSUrl(_ url: URL) -> Bool {
+        print("isHLSUrl")
         let urlString = url.absoluteString.lowercased()
-        return urlString.contains(".m3u8") ||
-            urlString.contains("/playlist.m3u8") ||
-            urlString.contains("/master.m3u8") ||
-            urlString.contains("format=m3u8")
+
+        // Fast path: obvious HLS indicators in URL
+        if urlString.contains(".m3u8") || urlString.contains("format=m3u8") {
+            print("isHLSUrl: Found HLS URL")
+            return true
+        }
+
+        // Fast path: Xtream Codes URLs are HLS-capable — no network round-trip needed.
+        if let xtream = parseXtreamCodesURL(url) {
+            let categoryStr = xtream.category?.rawValue ?? xtream.apiEndpoint ?? "api"
+            let extStr      = xtream.streamExtension ?? "none"
+            let outputStr   = xtream.outputFormat    ?? "none"
+            print("isHLSUrl: Xtream Codes URL — category=\(categoryStr) id=\(xtream.streamID ?? "-") ext=\(extStr) output=\(outputStr)")
+            return true
+        }
+
+        // For HTTP(S) URLs without obvious extension, check Content-Type header
+        guard let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https" else {
+            print("isHLSUrl: Not an HTTP(S) URL")
+            return false
+        }
+
+        // Synchronous HEAD request — MUST be called from a background queue (openUri already ensures this).
+        // WARNING: Do NOT call this on the main thread — semaphore.wait() will block it.
+        var detectedHLS = false
+        let semaphore = DispatchSemaphore(value: 0)
+
+        var request = URLRequest(url: url, timeoutInterval: 5.0)
+        request.httpMethod = "HEAD"
+
+        // Use a session that bypasses ATS so plain HTTP URLs are allowed.
+        // NSAllowsArbitraryLoads in the embedded Info.plist enables this at the OS level;
+        // makeInsecureSession() additionally handles self-signed HTTPS trust challenges.
+        let session = makeInsecureSession(timeout: 5.0)
+
+        session.dataTask(with: request) { _, response, error in
+            defer { semaphore.signal() }
+
+            if let error = error {
+                print("isHLSUrl: HEAD request failed: \(error.localizedDescription)")
+                return
+            }
+
+            guard let httpResponse = response as? HTTPURLResponse else {
+                print("isHLSUrl: HEAD request returned no HTTP response")
+                return
+            }
+
+            // Some servers don't support HEAD and return 405 Method Not Allowed
+            if httpResponse.statusCode == 405 {
+                print("isHLSUrl: Server returned 405 for HEAD, cannot determine Content-Type")
+                return
+            }
+
+            if let contentType = httpResponse.value(forHTTPHeaderField: "Content-Type")?.lowercased() {
+                print("isHLSUrl: Content-Type: \(contentType)")
+                // "mpegurl" covers both "application/x-mpegURL" and "application/vnd.apple.mpegurl"
+                detectedHLS = contentType.contains("mpegurl")
+            } else {
+                print("isHLSUrl: No Content-Type header in response")
+            }
+        }.resume()
+
+        // Use a timeout slightly above the request timeout so we never block longer than necessary
+        let waitResult = semaphore.wait(timeout: .now() + 5.5)
+        if waitResult == .timedOut {
+            print("isHLSUrl: Semaphore timed out waiting for HEAD response")
+        }
+
+        print("isHLSUrl: Detected HLS: \(detectedHLS)")
+        return detectedHLS
     }
 
     /// Configures the asset for HLS streaming
     private func configureHLSAsset(_ asset: AVURLAsset) -> AVURLAsset {
-        // Configure asset for optimal HLS streaming
+        // Configure asset for optimal HLS streaming.
+        // AVURLAssetAllowsConstrainedNetworkAccessKey: false allows plain HTTP (non-secure) streams
+        // by disabling the low-data mode network restriction that would otherwise block them.
         let options: [String: Any] = [
-            AVURLAssetPreferPreciseDurationAndTimingKey: true
+            AVURLAssetPreferPreciseDurationAndTimingKey: true,
+            AVURLAssetAllowsCellularAccessKey: true,
+            AVURLAssetAllowsConstrainedNetworkAccessKey: false
         ]
 
         // Create new asset with HLS-optimized options
@@ -143,6 +419,8 @@ class SharedVideoPlayer {
 
     /// Sets up HLS-specific monitoring
     private func setupHLSMonitoring(for item: AVPlayerItem) {
+        print("setupHLSMonitoring")
+
         // Monitor playback buffer
         bufferEmptyObserver = item.observe(\.isPlaybackBufferEmpty, options: [.new]) { [weak self] item, _ in
             self?.handleBufferEmpty(item.isPlaybackBufferEmpty)
@@ -350,6 +628,8 @@ class SharedVideoPlayer {
 
     /// Detects the MIME type of a file by reading its magic bytes (file signature)
     private func detectMimeType(at url: URL) -> String? {
+        print("detectMimeType for \(url.path)")
+
         guard url.isFileURL else { return nil }
 
         do {
@@ -374,28 +654,33 @@ class SharedVideoPlayer {
                             return "video/quicktime"
                         }
                     }
+                    print("detectMimeType: MP4/MOV file detected")
                     return "video/mp4"
                 }
             }
 
             // WebM/Matroska files start with 0x1A 0x45 0xDF 0xA3
             if bytes.count >= 4 && bytes[0] == 0x1A && bytes[1] == 0x45 && bytes[2] == 0xDF && bytes[3] == 0xA3 {
+                print("detectMimeType: WebM file detected")
                 return "video/webm"
             }
 
             // FLV files start with 'FLV'
             if bytes.count >= 3 && bytes[0] == 0x46 && bytes[1] == 0x4C && bytes[2] == 0x56 {
+                print("detectMimeType: FLV file detected")
                 return "video/x-flv"
             }
 
             // AVI files start with 'RIFF' ... 'AVI '
             if bytes.count >= 12 && bytes[0] == 0x52 && bytes[1] == 0x49 && bytes[2] == 0x46 && bytes[3] == 0x46 &&
                bytes[8] == 0x41 && bytes[9] == 0x56 && bytes[10] == 0x49 && bytes[11] == 0x20 {
+                print("detectMimeType: AVI file detected")
                 return "video/x-msvideo"
             }
 
             // MPEG-TS files start with 0x47 (sync byte)
             if bytes[0] == 0x47 {
+                print("detectMimeType: MPEG-TS file detected")
                 return "video/mp2t"
             }
 
@@ -409,6 +694,8 @@ class SharedVideoPlayer {
 
     /// Extracts metadata from the asset
     private func extractMetadata(from asset: AVAsset) {
+        print("extractMetadata for \(asset)")
+
         // Reset metadata values
         videoTitle = nil
         videoBitrate = 0
@@ -418,6 +705,7 @@ class SharedVideoPlayer {
 
         // Extract title from metadata
         if #available(macOS 13.0, *) {
+            print("extractMetadata: Title extraction using AVMetadataItem")
             Task {
                 do {
                     let commonMetadata = try await asset.load(.commonMetadata)
@@ -432,6 +720,7 @@ class SharedVideoPlayer {
                 }
             }
         } else {
+            print("extractMetadata: Title extraction using AVMetadataItem fallback")
             // Fallback for older OS versions
             let commonMetadata = asset.commonMetadata
             if let titleItem = AVMetadataItem.metadataItems(from: commonMetadata, filteredByIdentifier: .commonIdentifierTitle).first,
@@ -446,8 +735,11 @@ class SharedVideoPlayer {
             videoMimeType = "application/x-mpegURL"
         }
 
+        print("extractMetadata: Video title: \(videoTitle)")
+
         // Try to get bitrate from the asset directly
         if let urlAsset = asset as? AVURLAsset, !isHLSStream {
+            print("extractMetadata: Get bitrate from asset directly")
             // Try to get file size for non-HLS content
             do {
                 let fileAttributes = try FileManager.default.attributesOfItem(atPath: urlAsset.url.path)
@@ -456,6 +748,7 @@ class SharedVideoPlayer {
 
                     // Get duration in seconds
                     if #available(macOS 13.0, *) {
+                        print("extractMetadata: Get bitrate from asset duration")
                         Task {
                             do {
                                 let duration = try await asset.load(.duration)
@@ -472,6 +765,7 @@ class SharedVideoPlayer {
                             }
                         }
                     } else {
+                        print("extractMetadata: Get bitrate from duration (legacy)")
                         let durationInSeconds = CMTimeGetSeconds(asset.duration)
 
                         if durationInSeconds > 0 {
@@ -492,6 +786,7 @@ class SharedVideoPlayer {
 
         // Extract format information
         if #available(macOS 13.0, *) {
+            print("extractMetadata: Extract format information using AVAsset.loadTracks")
             Task {
                 do {
                     // Load tracks asynchronously
@@ -502,6 +797,7 @@ class SharedVideoPlayer {
                     if let videoTrack = videoTracks.first {
                         // Try to get estimated data rate directly from the track
                         if #available(macOS 13.0, *) {
+                            print("extractMetadata: Extract format information using AVTrack.load")
                             do {
                                 let estimatedDataRate = try await videoTrack.load(.estimatedDataRate)
                                 if estimatedDataRate > 0 && !isHLSStream {
@@ -513,6 +809,7 @@ class SharedVideoPlayer {
                             }
                         }
 
+                        print("extractMetadata: Extract format description")
                         // Get estimated data rate (bitrate) from format description
                         let formatDescriptions = try await videoTrack.load(.formatDescriptions)
                         if let formatDescription = formatDescriptions.first {
@@ -526,6 +823,7 @@ class SharedVideoPlayer {
 
                             // Get MIME type for non-HLS content
                             if !isHLSStream {
+                                print("extractMetadata: Extract MIME type")
                                 let mediaSubType = CMFormatDescriptionGetMediaSubType(formatDescription)
                                 let mediaType = CMFormatDescriptionGetMediaType(formatDescription)
 
@@ -547,6 +845,7 @@ class SharedVideoPlayer {
                         }
                     }
 
+                    print("extractMetadata: Extract audio information")
                     // Extract audio channels and sample rate
                     if let audioTrack = audioTracks.first {
                         let formatDescriptions = try await audioTrack.load(.formatDescriptions)
@@ -558,11 +857,15 @@ class SharedVideoPlayer {
                             }
                         }
                     }
+                    print("extractMetadata: audio information extracted successfully: \(audioChannels) channels, \(audioSampleRate) Hz")
                 } catch {
                     print("Error extracting metadata: \(error.localizedDescription)")
                 }
+
+                print("extractMetadata: Done")
             }
         } else {
+            print("extractMetadata: Extract format information using AVAsset.tracks")
             // Fallback for older OS versions
             // Extract video bitrate and format
             if let videoTrack = asset.tracks(withMediaType: .video).first {
@@ -622,8 +925,11 @@ class SharedVideoPlayer {
 
     /// Detects the video's native frame rate from its asset
     private func detectVideoFrameRate(from asset: AVAsset) {
+        print("Detecting video frame rate... isHLSStream: \(isHLSStream)")
+
         // For HLS streams, default to 30 fps as it's variable
         if isHLSStream {
+            print("HLS: Defaulting to 30 fps")
             videoFrameRate = 30.0
             updateCaptureFrameRate()
             return
@@ -682,11 +988,14 @@ class SharedVideoPlayer {
 
     /// Opens the video from the given URI (local or network)
     func openUri(_ uri: String) {
+        print("openUri: Opening video from \(uri)")
+
         isReadyForPlayback = false
         pendingPlay = false
 
         // Clean up previous observers
         cleanupObservers()
+        print("openUri: Cleaned up previous observers")
 
         // Determine the URL (local or network)
         let url: URL = {
@@ -701,24 +1010,39 @@ class SharedVideoPlayer {
         isHLSStream = isHLSUrl(url)
 
         if isHLSStream {
-            print("Detected HLS stream: \(url)")
+            print("openUri: Detected HLS stream: \(url)")
         }
 
         let mimeType = detectMimeType(at:url)
-        var asset = AVURLAsset(url: url, options: mimeType != nil ? ["AVURLAssetOutOfBandMIMETypeKey": mimeType!] : nil)
+        // AVURLAssetAllowsConstrainedNetworkAccessKey: false allows plain HTTP (non-secure) streams
+        var assetOptions: [String: Any] = [
+            AVURLAssetAllowsCellularAccessKey: true,
+            AVURLAssetAllowsConstrainedNetworkAccessKey: false
+        ]
+        if let mimeType = mimeType {
+            assetOptions["AVURLAssetOutOfBandMIMETypeKey"] = mimeType
+        }
+        var asset = AVURLAsset(url: url, options: assetOptions)
         // Configure asset for HLS if needed
         if isHLSStream {
             asset = configureHLSAsset(asset)
         }
 
+        print("openUri: Asset created: \(asset.url)")
+
         // Extract metadata from the asset
         extractMetadata(from: asset)
+
+        print("openUri: Metadata extracted")
 
         // Detect video frame rate
         detectVideoFrameRate(from: asset)
 
+        print("openUri: Video frame rate detected: \(videoFrameRate)")
+
         // Retrieve the video track to obtain the actual dimensions
         asset.loadTracks(withMediaType: .video) { [self] tracks, error in
+            print("openUri: Load video track properties")
             guard let videoTrack = tracks?.first, error == nil else {
                 print(
                     "Erreur lors du chargement des pistes vidéo : \(error?.localizedDescription ?? "Inconnue")"
@@ -734,6 +1058,7 @@ class SharedVideoPlayer {
             }
 
             if #available(macOS 13.0, *) {
+                print("openUri: Load video track properties using AVTrack.load")
                 Task { [weak self, asset] in
                     guard let self = self else { return }
                     do {
@@ -760,6 +1085,7 @@ class SharedVideoPlayer {
                     }
                 }
             } else {
+                print("openUri: Load video track properties using deprecated properties")
                 // Fallback for older OS versions using deprecated properties
                 let naturalSize = videoTrack.naturalSize
                 let transform = videoTrack.preferredTransform
@@ -777,20 +1103,26 @@ class SharedVideoPlayer {
 
     // Helper method to setup frame buffer
     private func setupFrameBuffer() {
+        print("setupFrameBuffer: \(frameWidth)x\(frameHeight)")
+
         // Allocate or reuse the shared buffer if capacity matches
         let totalPixels = frameWidth * frameHeight
         if let buffer = frameBuffer, bufferCapacity == totalPixels {
             buffer.initialize(repeating: 0, count: totalPixels)
+            print("setupFrameBuffer: Reusing existing buffer")
         } else {
             frameBuffer?.deallocate()
             frameBuffer = UnsafeMutablePointer<UInt32>.allocate(capacity: totalPixels)
             frameBuffer?.initialize(repeating: 0, count: totalPixels)
             bufferCapacity = totalPixels
+            print("setupFrameBuffer: Allocating new buffer")
         }
     }
 
     // Helper method to setup video output and player
     private func setupVideoOutputAndPlayer(with asset: AVAsset) {
+        print("setupVideoOutputAndPlayer")
+
         // Create attributes for the CVPixelBuffer (BGRA format) with IOSurface for better performance
         let pixelBufferAttributes: [String: Any] = [
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
@@ -855,6 +1187,8 @@ class SharedVideoPlayer {
 
     /// Captures initial frame to display without starting the display link
     private func captureInitialFrame() {
+        print("captureInitialFrame")
+
         guard let output = videoOutput, player?.currentItem != nil, !isHLSStream else { return }
 
         // Seek to the beginning to ensure we have a frame
@@ -1069,14 +1403,14 @@ class SharedVideoPlayer {
                 process: self.tapProcess
             )
 
-            var tap: Unmanaged<MTAudioProcessingTap>?
+            var tap: MTAudioProcessingTap?
             // Create the audio processing tap
             let status = MTAudioProcessingTapCreate(
                 kCFAllocatorDefault, &callbacks, kMTAudioProcessingTapCreationFlag_PostEffects, &tap
             )
             if status == noErr, let tap = tap {
                 print("Audio tap created successfully")
-                inputParams.audioTapProcessor = tap.takeRetainedValue()
+                inputParams.audioTapProcessor = tap
                 let audioMix = AVMutableAudioMix()
                 audioMix.inputParameters = [inputParams]
                 playerItem.audioMix = audioMix

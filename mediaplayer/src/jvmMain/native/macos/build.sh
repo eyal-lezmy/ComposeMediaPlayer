@@ -5,6 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 RESOURCES_DIR="$SCRIPT_DIR/../../resources"
 
 SWIFT_SOURCE="$SCRIPT_DIR/NativeVideoPlayer.swift"
+INFO_PLIST="$SCRIPT_DIR/Info.plist"
 
 # Output directories (JNA resource path convention)
 ARM64_DIR="$RESOURCES_DIR/darwin-aarch64"
@@ -17,6 +18,7 @@ swiftc -emit-library -emit-module -module-name NativeVideoPlayer \
     -target arm64-apple-macosx14.0 \
     -o "$ARM64_DIR/libNativeVideoPlayer.dylib" \
     "$SWIFT_SOURCE" \
+    -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker "$INFO_PLIST" \
     -O -whole-module-optimization
 
 echo "=== Building NativeVideoPlayer for macOS x86_64 ==="
@@ -24,6 +26,7 @@ swiftc -emit-library -emit-module -module-name NativeVideoPlayer \
     -target x86_64-apple-macosx14.0 \
     -o "$X64_DIR/libNativeVideoPlayer.dylib" \
     "$SWIFT_SOURCE" \
+    -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker "$INFO_PLIST" \
     -O -whole-module-optimization
 
 # Clean up swift build artifacts
