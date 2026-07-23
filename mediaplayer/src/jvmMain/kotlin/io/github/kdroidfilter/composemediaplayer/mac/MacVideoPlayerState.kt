@@ -106,7 +106,7 @@ class MacVideoPlayerState : VideoPlayerState {
 
     private val _durationText = mutableStateOf("00:00")
     override val durationText: String get() = _durationText.value
-    
+
     override val currentTime: Double
         get() = runBlocking {
             if (hasMedia) getPositionSafely() else 0.0

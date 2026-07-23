@@ -97,6 +97,32 @@ public func nativeVideoPlayerLibInit() {
 /// SharedVideoPlayer initializer to ensure it fires before any network call.
 private let _atsPatchOnce: Void = patchATSInMainBundle()
 
+// MARK: - Async Timeout Helper
+
+/// Runs `operation` and cancels it if it does not complete within `seconds`.
+/// Throws `AssetLoadingTimeoutError` when the deadline expires.
+struct AssetLoadingTimeoutError: Error {
+    let seconds: Double
+    var localizedDescription: String { "Asset loading timed out after \(seconds)s" }
+}
+
+func withAssetLoadingTimeout<T: Sendable>(
+    seconds: Double,
+    operation: @escaping @Sendable () async throws -> T
+) async throws -> T {
+    return try await withThrowingTaskGroup(of: T.self) { group in
+        group.addTask { try await operation() }
+        group.addTask {
+            try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+            throw AssetLoadingTimeoutError(seconds: seconds)
+        }
+        // Return the first result (or throw the first error).
+        let result = try await group.next()!
+        group.cancelAll()
+        return result
+    }
+}
+
 // MARK: - SharedVideoPlayer
 
 /// Class that manages video playback and frame capture into an optimized shared buffer.
@@ -935,44 +961,27 @@ class SharedVideoPlayer {
             return
         }
 
-        asset.loadTracks(withMediaType: .video) { [self] tracks, error in
-            guard let videoTrack = tracks?.first, error == nil else {
-                print(
-                    "Erreur lors du chargement des pistes vidéo : \(error?.localizedDescription ?? "Inconnue")"
-                )
-                return
-            }
-
-            // Replace deprecated nominalFrameRate property
-            if #available(macOS 13.0, *) {
-                Task {
-                    do {
-                        let frameRate = try await videoTrack.load(.nominalFrameRate)
-                        self.videoFrameRate = Float(frameRate)
-                        if self.videoFrameRate <= 0 {
-                            // Fallback to common default if detection fails
-                            self.videoFrameRate = 30.0
-                        }
-
-                        // Set capture rate to the lower of the two rates
-                        self.updateCaptureFrameRate()
-                    } catch {
-                        print("Error loading nominal frame rate: \(error.localizedDescription)")
-                        // Fallback to common default if detection fails
-                        self.videoFrameRate = 30.0
-                        self.updateCaptureFrameRate()
-                    }
+        // Use async/await to avoid the callback-based API which may never fire for
+        // remote or not-yet-loaded assets.
+        Task { [weak self] in
+            guard let self = self else { return }
+            do {
+                let tracks = try await withAssetLoadingTimeout(seconds: 10) {
+                    try await asset.loadTracks(withMediaType: .video)
                 }
-            } else {
-                // Use deprecated property for older OS versions
-                videoFrameRate = Float(videoTrack.nominalFrameRate)
-                if videoFrameRate <= 0 {
-                    // Fallback to common default if detection fails
-                    videoFrameRate = 30.0
+                guard let videoTrack = tracks.first else {
+                    print("detectVideoFrameRate: No video tracks found")
+                    self.videoFrameRate = 30.0
+                    self.updateCaptureFrameRate()
+                    return
                 }
-
-                // Set capture rate to the lower of the two rates
-                updateCaptureFrameRate()
+                let frameRate = try await videoTrack.load(.nominalFrameRate)
+                self.videoFrameRate = frameRate > 0 ? Float(frameRate) : 30.0
+                self.updateCaptureFrameRate()
+            } catch {
+                print("detectVideoFrameRate: Error loading tracks/frameRate: \(error.localizedDescription)")
+                self.videoFrameRate = 30.0
+                self.updateCaptureFrameRate()
             }
         }
     }
@@ -1040,63 +1049,50 @@ class SharedVideoPlayer {
 
         print("openUri: Video frame rate detected: \(videoFrameRate)")
 
-        // Retrieve the video track to obtain the actual dimensions
-        asset.loadTracks(withMediaType: .video) { [self] tracks, error in
+        // Retrieve the video track to obtain the actual dimensions.
+        // Use async/await instead of the callback-based API because the completion
+        // handler may never be invoked for remote (network) assets that are not
+        // yet fully loaded when loadTracks is called.
+        Task { [weak self, asset] in
+            guard let self = self else { return }
             print("openUri: Load video track properties")
-            guard let videoTrack = tracks?.first, error == nil else {
-                print(
-                    "Erreur lors du chargement des pistes vidéo : \(error?.localizedDescription ?? "Inconnue")"
-                )
-                // For HLS streams without video track info yet, use default dimensions
-                if isHLSStream {
-                    frameWidth = 1920
-                    frameHeight = 1080
-                    setupFrameBuffer()
-                    setupVideoOutputAndPlayer(with: asset)
+            do {
+                let tracks = try await withAssetLoadingTimeout(seconds: 10) {
+                    try await asset.loadTracks(withMediaType: .video)
                 }
-                return
-            }
-
-            if #available(macOS 13.0, *) {
-                print("openUri: Load video track properties using AVTrack.load")
-                Task { [weak self, asset] in
-                    guard let self = self else { return }
-                    do {
-                        // Use the modern API to load naturalSize and preferredTransform
-                        let naturalSize = try await videoTrack.load(.naturalSize)
-                        let transform = try await videoTrack.load(.preferredTransform)
-
-                        let effectiveSize = naturalSize.applying(transform)
-                        self.frameWidth = Int(abs(effectiveSize.width))
-                        self.frameHeight = Int(abs(effectiveSize.height))
-
-                        // Continue with buffer allocation and setup
+                guard let videoTrack = tracks.first else {
+                    print("openUri: No video tracks found")
+                    // For HLS streams without video track info yet, use default dimensions
+                    if self.isHLSStream {
+                        self.frameWidth = 1920
+                        self.frameHeight = 1080
                         self.setupFrameBuffer()
                         self.setupVideoOutputAndPlayer(with: asset)
-                    } catch {
-                        print("Error loading video track properties: \(error.localizedDescription)")
-                        // Use default dimensions for HLS if loading fails
-                        if self.isHLSStream {
-                            self.frameWidth = 1920
-                            self.frameHeight = 1080
-                            self.setupFrameBuffer()
-                            self.setupVideoOutputAndPlayer(with: asset)
-                        }
                     }
+                    return
                 }
-            } else {
-                print("openUri: Load video track properties using deprecated properties")
-                // Fallback for older OS versions using deprecated properties
-                let naturalSize = videoTrack.naturalSize
-                let transform = videoTrack.preferredTransform
+
+                print("openUri: Load video track properties using AVTrack.load")
+                // Use the modern API to load naturalSize and preferredTransform
+                let naturalSize = try await videoTrack.load(.naturalSize)
+                let transform = try await videoTrack.load(.preferredTransform)
 
                 let effectiveSize = naturalSize.applying(transform)
-                frameWidth = Int(abs(effectiveSize.width))
-                frameHeight = Int(abs(effectiveSize.height))
+                self.frameWidth = Int(abs(effectiveSize.width))
+                self.frameHeight = Int(abs(effectiveSize.height))
 
                 // Continue with buffer allocation and setup
-                setupFrameBuffer()
-                setupVideoOutputAndPlayer(with: asset)
+                self.setupFrameBuffer()
+                self.setupVideoOutputAndPlayer(with: asset)
+            } catch {
+                print("openUri: Error loading video track properties: \(error.localizedDescription)")
+                // Use default dimensions for HLS if loading fails
+                if self.isHLSStream {
+                    self.frameWidth = 1920
+                    self.frameHeight = 1080
+                    self.setupFrameBuffer()
+                    self.setupVideoOutputAndPlayer(with: asset)
+                }
             }
         }
     }
@@ -1381,41 +1377,50 @@ class SharedVideoPlayer {
             return
         }
 
-        // Load audio tracks asynchronously
-        asset.loadTracks(withMediaType: .audio) { tracks, error in
-            guard let audioTrack = tracks?.first, error == nil else {
-                print("No audio track found or error: \(error?.localizedDescription ?? "unknown")")
-                return
-            }
+        // Use async/await instead of the callback-based API because the completion
+        // handler may never be invoked for remote (network) assets.
+        Task { [weak self] in
+            guard let self = self else { return }
+            do {
+                let tracks = try await withAssetLoadingTimeout(seconds: 10) {
+                    try await asset.loadTracks(withMediaType: .audio)
+                }
+                guard let audioTrack = tracks.first else {
+                    print("No audio track found")
+                    return
+                }
 
-            print("Audio track found, setting up tap")
+                print("Audio track found, setting up tap")
 
-            // Create input parameters with a processing tap
-            let inputParams = AVMutableAudioMixInputParameters(track: audioTrack)
+                // Create input parameters with a processing tap
+                let inputParams = AVMutableAudioMixInputParameters(track: audioTrack)
 
-            var callbacks = MTAudioProcessingTapCallbacks(
-                version: kMTAudioProcessingTapCallbacksVersion_0,
-                clientInfo: UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque()),
-                init: self.tapInit,
-                finalize: self.tapFinalize,
-                prepare: self.tapPrepare,
-                unprepare: self.tapUnprepare,
-                process: self.tapProcess
-            )
+                var callbacks = MTAudioProcessingTapCallbacks(
+                    version: kMTAudioProcessingTapCallbacksVersion_0,
+                    clientInfo: UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque()),
+                    init: self.tapInit,
+                    finalize: self.tapFinalize,
+                    prepare: self.tapPrepare,
+                    unprepare: self.tapUnprepare,
+                    process: self.tapProcess
+                )
 
-            var tap: MTAudioProcessingTap?
-            // Create the audio processing tap
-            let status = MTAudioProcessingTapCreate(
-                kCFAllocatorDefault, &callbacks, kMTAudioProcessingTapCreationFlag_PostEffects, &tap
-            )
-            if status == noErr, let tap = tap {
-                print("Audio tap created successfully")
-                inputParams.audioTapProcessor = tap
-                let audioMix = AVMutableAudioMix()
-                audioMix.inputParameters = [inputParams]
-                playerItem.audioMix = audioMix
-            } else {
-                print("Audio Tap creation failed with status: \(status)")
+                var tap: MTAudioProcessingTap?
+                // Create the audio processing tap
+                let status = MTAudioProcessingTapCreate(
+                    kCFAllocatorDefault, &callbacks, kMTAudioProcessingTapCreationFlag_PostEffects, &tap
+                )
+                if status == noErr, let tap = tap {
+                    print("Audio tap created successfully")
+                    inputParams.audioTapProcessor = tap
+                    let audioMix = AVMutableAudioMix()
+                    audioMix.inputParameters = [inputParams]
+                    playerItem.audioMix = audioMix
+                } else {
+                    print("Audio Tap creation failed with status: \(status)")
+                }
+            } catch {
+                print("setupAudioTap: Error loading audio tracks: \(error.localizedDescription)")
             }
         }
     }

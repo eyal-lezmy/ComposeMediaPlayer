@@ -21,7 +21,7 @@ val ref = System.getenv("GITHUB_REF") ?: ""
 val version = if (ref.startsWith("refs/tags/")) {
     val tag = ref.removePrefix("refs/tags/")
     if (tag.startsWith("v")) tag.substring(1) else tag
-} else "dev"
+} else "9.9.99"
 
 
 tasks.withType<DokkaTask>().configureEach {
@@ -244,5 +244,5 @@ mavenPublishing {
     }
 
     publishToMavenCentral()
-    signAllPublications()
+//    signAllPublications()
 }
