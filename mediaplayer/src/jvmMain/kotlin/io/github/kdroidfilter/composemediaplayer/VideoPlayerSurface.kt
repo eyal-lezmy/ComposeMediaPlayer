@@ -8,6 +8,8 @@ import io.github.kdroidfilter.composemediaplayer.linux.LinuxVideoPlayerState
 import io.github.kdroidfilter.composemediaplayer.linux.LinuxVideoPlayerSurface
 import io.github.kdroidfilter.composemediaplayer.mac.MacVideoPlayerState
 import io.github.kdroidfilter.composemediaplayer.mac.MacVideoPlayerSurface
+import io.github.kdroidfilter.composemediaplayer.vlc.VlcVideoPlayerState
+import io.github.kdroidfilter.composemediaplayer.vlc.VlcVideoPlayerSurface
 import io.github.kdroidfilter.composemediaplayer.windows.WindowsVideoPlayerState
 import io.github.kdroidfilter.composemediaplayer.windows.WindowsVideoPlayerSurface
 
@@ -33,13 +35,17 @@ actual fun VideoPlayerSurface(
     contentScale: ContentScale,
     overlay: @Composable () -> Unit
 ) {
-    if (playerState is DefaultVideoPlayerState)
-        when (val delegate = playerState.delegate) {
-            is WindowsVideoPlayerState -> WindowsVideoPlayerSurface(delegate, modifier, contentScale, overlay)
-            is MacVideoPlayerState -> MacVideoPlayerSurface(delegate, modifier, contentScale, overlay)
-            is LinuxVideoPlayerState -> LinuxVideoPlayerSurface(delegate, modifier, contentScale, overlay)
-            else -> throw IllegalArgumentException("Unsupported player state type")
-        }
-    else
-        throw IllegalArgumentException("Unsupported player state type")
+    when (playerState) {
+        // A libVLC-backed state used directly (not wrapped in DefaultVideoPlayerState), for containers
+        // or codecs the platform backend can't demux (mkv/HEVC, ...).
+        is VlcVideoPlayerState -> VlcVideoPlayerSurface(playerState, modifier, contentScale, overlay)
+        is DefaultVideoPlayerState ->
+            when (val delegate = playerState.delegate) {
+                is WindowsVideoPlayerState -> WindowsVideoPlayerSurface(delegate, modifier, contentScale, overlay)
+                is MacVideoPlayerState -> MacVideoPlayerSurface(delegate, modifier, contentScale, overlay)
+                is LinuxVideoPlayerState -> LinuxVideoPlayerSurface(delegate, modifier, contentScale, overlay)
+                else -> throw IllegalArgumentException("Unsupported player state type")
+            }
+        else -> throw IllegalArgumentException("Unsupported player state type")
+    }
 }

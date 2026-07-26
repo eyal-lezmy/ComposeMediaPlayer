@@ -112,6 +112,12 @@ kotlin {
             implementation(libs.jna.jpms)
             implementation(libs.jna.platform.jpms)
             implementation(libs.slf4j.simple)
+            // libVLC binding for the bundled-VLC playback backend. JNA is provided by jna-jpms above,
+            // so exclude vlcj's own plain-jna to avoid duplicate com.sun.jna classes.
+            implementation(libs.vlcj.get().toString()) {
+                exclude(group = "net.java.dev.jna", module = "jna")
+                exclude(group = "net.java.dev.jna", module = "jna-platform")
+            }
         }
 
         jvmTest.dependencies {
