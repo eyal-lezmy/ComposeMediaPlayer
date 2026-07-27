@@ -15,8 +15,12 @@ import io.github.kdroidfilter.composemediaplayer.util.toCanvasModifier
 
 /**
  * Renders [VlcVideoPlayerState]'s frames (bundled libVLC). Same shape as `MacVideoPlayerSurface`: draw
- * the latest [androidx.compose.ui.graphics.ImageBitmap] scaled to the surface, overlay on top.
- * Fullscreen-as-separate-window and the subtitle layer are intentionally out of scope for this surface.
+ * the latest [androidx.compose.ui.graphics.ImageBitmap] scaled to the surface, overlay on top, and
+ * hand both to a separate fullscreen window while [VlcVideoPlayerState.isFullscreen] is set.
+ * The subtitle layer is intentionally out of scope for this surface.
+ *
+ * @param isInFullscreenWindow Whether this surface is the one already inside the fullscreen window —
+ *                             it draws the frames then, and must not open a second window.
  */
 @Composable
 fun VlcVideoPlayerSurface(
@@ -24,9 +28,12 @@ fun VlcVideoPlayerSurface(
     modifier: Modifier = Modifier,
     contentScale: ContentScale = ContentScale.Fit,
     overlay: @Composable () -> Unit = {},
+    isInFullscreenWindow: Boolean = false,
 ) {
     Box(modifier = modifier, contentAlignment = Alignment.Center) {
-        if (playerState.hasMedia) {
+        // While fullscreen, only the fullscreen window draws frames — the windowed surface stays
+        // black behind it rather than decoding the same picture into two canvases.
+        if (playerState.hasMedia && (!playerState.isFullscreen || isInFullscreenWindow)) {
             val currentFrame by remember(playerState) { playerState.currentFrameState }
             currentFrame?.let { frame ->
                 Canvas(
@@ -43,5 +50,9 @@ fun VlcVideoPlayerSurface(
             }
         }
         Box(modifier = Modifier.fillMaxSize()) { overlay() }
+    }
+
+    if (playerState.isFullscreen && !isInFullscreenWindow) {
+        openFullscreenWindow(playerState, overlay = overlay, contentScale = contentScale)
     }
 }

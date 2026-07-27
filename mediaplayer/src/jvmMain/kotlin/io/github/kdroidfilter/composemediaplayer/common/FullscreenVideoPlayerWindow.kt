@@ -55,7 +55,9 @@ private fun FullscreenVideoPlayerWindow(
     // Create a window state for fullscreen
     val windowState = rememberWindowState(placement = WindowPlacement.Maximized)
 
-    var isVisible by mutableStateOf(true)
+    // Must be remembered: an un-remembered mutableStateOf is rebuilt as `true` on the very
+    // recomposition that exitFullScreen() triggers, so the window flashes back into existence.
+    var isVisible by remember { mutableStateOf(true) }
 
     // Handle window close to exit fullscreen
     DisposableEffect(Unit) {
