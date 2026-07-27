@@ -37,6 +37,12 @@ import uk.co.caprica.vlcj.player.embedded.videosurface.callback.format.RV32Buffe
 import java.nio.ByteBuffer
 
 /**
+ * Scale of [VideoPlayerState.sliderPos] and [VideoPlayerState.seekTo]: permille of the media, as
+ * every other backend in this library reports it (the interface KDoc's `0f..1f` is stale).
+ */
+private const val SLIDER_SCALE = 1000f
+
+/**
  * A [VideoPlayerState] backed by the **bundled** libVLC, so containers/codecs a platform backend can't
  * demux (mkv/HEVC/AC3, etc.) still play. Video is rendered through vlcj's callback surface: libVLC hands
  * RV32 (BGRA) frames to [RenderCallback.display], which are copied into a Skia bitmap and published as
@@ -80,6 +86,18 @@ class VlcVideoPlayerState : VideoPlayerState {
     override val durationText: String get() = _durationText.value
     private val _aspectRatio = mutableStateOf(16f / 9f)
     override val aspectRatio: Float get() = _aspectRatio.value
+
+    /**
+     * Last plausible media length in ms, or 0 while unknown. libVLC only knows the length once the
+     * media is parsed — before that `status().length()` is 0, and for some containers the first
+     * value it publishes is one the playhead later overruns. Scaling [sliderPos] by such a length
+     * pins the bar at 100% seconds into a movie, so the length is kept here (fed by
+     * `lengthChanged`, refreshed whenever the position passes it) instead of being re-read blind on
+     * every tick.
+     */
+    @Volatile
+    private var lengthMs: Long = 0L
+
     override val currentTime: Double get() = player.status().time() / 1000.0
 
     override val leftLevel: Float = 0f
@@ -135,25 +153,35 @@ class VlcVideoPlayerState : VideoPlayerState {
                 isLoading = false
                 error = VideoPlayerError.SourceError("libVLC could not play this media")
             }
-            override fun lengthChanged(mp: MediaPlayer, newLength: Long) = onUi {
-                metadata.duration = newLength
-                _durationText.value = formatTime(newLength / 1000.0)
-            }
+            override fun lengthChanged(mp: MediaPlayer, newLength: Long) = onUi { updateLength(newLength) }
             override fun timeChanged(mp: MediaPlayer, newTime: Long) = onUi {
-                if (!userDragging) {
-                    _positionText.value = formatTime(newTime / 1000.0)
-                    val len = player.status().length()
-                    if (len > 0) sliderPos = (newTime.toFloat() / len * 1000f).coerceIn(0f, 1000f)
+                if (userDragging) return@onUi
+                _positionText.value = formatTime(newTime / 1000.0)
+                // A length the playhead has already passed is a pre-parse/under-reported one: ask
+                // libVLC again rather than scale by it. Until a plausible length exists the bar
+                // simply holds — an honest "unknown" beats racing to the end.
+                if (lengthMs <= newTime) updateLength(player.status().length())
+                if (lengthMs > newTime) {
+                    sliderPos = (newTime.toFloat() / lengthMs * SLIDER_SCALE).coerceIn(0f, SLIDER_SCALE)
                 }
             }
             override fun finished(mp: MediaPlayer) = onUi {
                 if (loop) ioScope.launch { player.submit { player.controls().setPosition(0f); player.controls().play() } }
-                else { isPlaying = false; sliderPos = 1000f }
+                else { isPlaying = false; sliderPos = SLIDER_SCALE }
             }
         })
     }
 
     private inline fun onUi(crossinline block: () -> Unit) { uiScope.launch { block() } }
+
+    /** Publishes a new media length (ms, `<= 0` meaning "not known yet"). Main thread only. */
+    private fun updateLength(newLength: Long) {
+        val len = newLength.coerceAtLeast(0L)
+        if (len == lengthMs) return
+        lengthMs = len
+        metadata.duration = len.takeIf { it > 0 }
+        _durationText.value = formatTime(len / 1000.0)
+    }
 
     private fun onDimensions(w: Int, h: Int) = onUi {
         if (w > 0 && h > 0) {
@@ -216,6 +244,13 @@ class VlcVideoPlayerState : VideoPlayerState {
     override fun openUri(uri: String, initializeplayerState: InitialPlayerState) {
         isLoading = true
         error = null
+        // Nothing is known about the new media yet; carrying the previous one's length over would
+        // scale the bar against the wrong movie until the first lengthChanged arrives.
+        lengthMs = 0L
+        metadata.duration = null
+        sliderPos = 0f
+        _positionText.value = formatTime(0.0)
+        _durationText.value = formatTime(0.0)
         ioScope.launch {
             player.audio().setVolume((_volume.value * 100).toInt())
             val ok = player.media().play(uri)
@@ -232,7 +267,7 @@ class VlcVideoPlayerState : VideoPlayerState {
     override fun stop() { ioScope.launch { player.submit { player.controls().stop() } }; hasMedia = false; isPlaying = false }
 
     override fun seekTo(value: Float) {
-        val pos = (value / 1000f).coerceIn(0f, 1f)
+        val pos = (value / SLIDER_SCALE).coerceIn(0f, 1f)
         sliderPos = value
         ioScope.launch { player.submit { player.controls().setPosition(pos) } }
     }
