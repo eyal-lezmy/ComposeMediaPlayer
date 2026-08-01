@@ -5,6 +5,9 @@ import com.sun.jna.Native
 import io.github.kdroidfilter.composemediaplayer.util.buildLocalLogger
 import uk.co.caprica.vlcj.factory.MediaPlayerFactory
 import java.io.File
+import java.net.JarURLConnection
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 
 internal val vlcLogger = buildLocalLogger("VlcNativeInit")
 
@@ -63,10 +66,11 @@ object VlcNativeInit {
     }
 
     /** Extract the vendored libs + plugins for this platform to a stable cache dir (idempotent). */
-    private fun extractNatives(): File {
+    internal fun extractNatives(
+        cache: File = File(System.getProperty("java.io.tmpdir"), "composemediaplayer-vlc/${currentPlatformDir()}"),
+    ): File {
         val platform = currentPlatformDir()
         val base = "/vlc/$platform"
-        val cache = File(System.getProperty("java.io.tmpdir"), "composemediaplayer-vlc/$platform")
         val libDir = File(cache, "lib").apply { mkdirs() }
         val pluginsDir = File(cache, "plugins").apply { mkdirs() }
 
@@ -79,7 +83,24 @@ object VlcNativeInit {
         for (name in index) {
             copyResource("$base/plugins/$name", File(pluginsDir, name))
         }
+        prunePlugins(pluginsDir, index.toSet())
         return cache
+    }
+
+    /**
+     * Deletes anything in the cache the current bundle no longer ships. libVLC loads every file it
+     * finds under `VLC_PLUGIN_PATH`, not the ones [readResourceLines] named, so a plugin dropped
+     * from the bundle keeps being loaded on every machine that once extracted it — which would
+     * quietly undo a plugin trim (a licence decision, not a size one) on exactly the developer
+     * machines that have run the library longest.
+     */
+    private fun prunePlugins(pluginsDir: File, keep: Set<String>) {
+        pluginsDir.listFiles().orEmpty()
+            .filter { it.name !in keep }
+            .forEach {
+                vlcLogger.d { "removing stale bundled plugin ${it.name}" }
+                it.delete()
+            }
     }
 
     private fun currentPlatformDir(): String {
@@ -96,12 +117,44 @@ object VlcNativeInit {
         }
     }
 
+    /**
+     * Extracts [resource] to [target], reusing what is already there **only when it is the size the
+     * bundle ships**.
+     *
+     * "The file exists and isn't empty" is not enough: a copy cut short (the process killed
+     * mid-extraction) and a leftover from an older bundle both pass that test and then stay forever,
+     * because the cache dir is stable across versions. libVLC reports such a file as nothing at all
+     * — a truncated `libts_plugin.dylib` becomes `no demux modules matched`, i.e. every MPEG-TS
+     * stream failing with "VLC is unable to open the MRL", with the plugin named only in a
+     * `-vv` warning nobody sees.
+     *
+     * The copy itself goes through a temp file and an atomic rename, so a kill mid-write leaves the
+     * previous file (or nothing) rather than a new truncated one.
+     */
     private fun copyResource(resource: String, target: File) {
-        if (target.isFile && target.length() > 0) return // already extracted
+        val expected = resourceSize(resource)
+        val cached = target.length()
+        if (target.isFile && (if (expected >= 0) cached == expected else cached > 0)) return
+        if (target.isFile) {
+            vlcLogger.d { "re-extracting ${target.name}: $cached bytes on disk, $expected expected" }
+        }
         val stream = VlcNativeInit::class.java.getResourceAsStream(resource)
             ?: error("Bundled VLC resource missing: $resource")
-        stream.use { input -> target.outputStream().use { input.copyTo(it) } }
-        target.setExecutable(true)
+        val partial = File(target.parentFile, "${target.name}.partial")
+        stream.use { input -> partial.outputStream().use { input.copyTo(it) } }
+        partial.setExecutable(true)
+        Files.move(partial.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING)
+    }
+
+    /** Size [resource] occupies in the bundle, or `-1` when the packaging doesn't declare one. */
+    private fun resourceSize(resource: String): Long {
+        val url = VlcNativeInit::class.java.getResource(resource) ?: return -1L
+        return runCatching {
+            when (val connection = url.openConnection()) {
+                is JarURLConnection -> connection.jarEntry.size
+                else -> connection.contentLengthLong
+            }
+        }.getOrDefault(-1L)
     }
 
     private fun readResourceLines(resource: String): List<String> =
