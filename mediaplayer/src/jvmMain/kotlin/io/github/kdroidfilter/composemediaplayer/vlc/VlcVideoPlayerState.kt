@@ -324,7 +324,15 @@ class VlcVideoPlayerState : VideoPlayerState {
         try {
         synchronized(frameLock) {
             if (bitmapA == null || frameW != w || frameH != h) {
-                bitmapA?.close(); bitmapB?.close()
+                // Drop the old pair instead of `close()`-ing it: the ImageBitmap published from it is
+                // still referenced by composition and by any recorded GraphicsLayer, and Compose turns
+                // it into an SkImage on the AWT thread at draw time. Closing here zeroes the native
+                // SkBitmap pointer under that draw -> SIGSEGV at 0x0 inside
+                // SkImages::RasterFromBitmap (composeApp/hs_err_pid78542.log). Reached on every
+                // resolution change, i.e. every channel zap and every adaptive HLS variant switch.
+                // Skia's Bitmap is a Managed with a cleaner, so the frees still happen once the last
+                // published frame is unreachable.
+                bitmapA = null; bitmapB = null
                 val info = ImageInfo(w, h, ColorType.BGRA_8888, ColorAlphaType.OPAQUE)
                 bitmapA = Bitmap().apply { allocPixels(info) }
                 bitmapB = Bitmap().apply { allocPixels(info) }
@@ -397,13 +405,16 @@ class VlcVideoPlayerState : VideoPlayerState {
     override fun clearError() { error = null }
 
     override fun dispose() {
-        uiScope.launch { isPlaying = false; hasMedia = false }
+        uiScope.launch { isPlaying = false; hasMedia = false; _currentFrame.value = null }
         ioScope.launch {
             try { player.controls().stop() } catch (_: Throwable) {}
             try { player.release() } catch (_: Throwable) {}
         }
+        // Same reason as the format-change branch of [onFrame]: the last published frame can still be
+        // drawn after dispose (the surface leaves composition on the next frame, not synchronously),
+        // so the buffers are released to the GC rather than closed under a live draw.
         synchronized(frameLock) {
-            bitmapA?.close(); bitmapB?.close(); bitmapA = null; bitmapB = null
+            bitmapA = null; bitmapB = null; frameW = 0; frameH = 0
         }
     }
 }
