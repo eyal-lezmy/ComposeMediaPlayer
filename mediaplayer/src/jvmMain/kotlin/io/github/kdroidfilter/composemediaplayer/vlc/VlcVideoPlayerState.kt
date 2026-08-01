@@ -3,6 +3,7 @@ package io.github.kdroidfilter.composemediaplayer.vlc
 import androidx.compose.runtime.Stable
 import androidx.compose.runtime.State
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.graphics.Color
@@ -12,6 +13,7 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.sp
+import io.github.kdroidfilter.composemediaplayer.AudioTrack
 import io.github.kdroidfilter.composemediaplayer.InitialPlayerState
 import io.github.kdroidfilter.composemediaplayer.SubtitleTrack
 import io.github.kdroidfilter.composemediaplayer.VideoMetadata
@@ -27,8 +29,10 @@ import org.jetbrains.skia.Bitmap
 import org.jetbrains.skia.ColorAlphaType
 import org.jetbrains.skia.ColorType
 import org.jetbrains.skia.ImageInfo
+import uk.co.caprica.vlcj.media.TrackType
 import uk.co.caprica.vlcj.player.base.MediaPlayer
 import uk.co.caprica.vlcj.player.base.MediaPlayerEventAdapter
+import uk.co.caprica.vlcj.player.base.TrackDescription
 import uk.co.caprica.vlcj.player.embedded.EmbeddedMediaPlayer
 import uk.co.caprica.vlcj.player.embedded.videosurface.callback.BufferFormat
 import uk.co.caprica.vlcj.player.embedded.videosurface.callback.BufferFormatCallback
@@ -41,6 +45,39 @@ import java.nio.ByteBuffer
  * every other backend in this library reports it (the interface KDoc's `0f..1f` is stale).
  */
 private const val SLIDER_SCALE = 1000f
+
+/** libVLC's "no track" id: what `setTrack` takes to turn a track off, and what `track()` reads back then. */
+private const val TRACK_DISABLED = -1
+
+/**
+ * Language libVLC advertises for a track. Its descriptions read `"Track 1 - [English]"`, or plainly
+ * `"English"` when the demuxer only knows a name — the bracketed part, when there is one, is the
+ * language and the rest is libVLC's own numbering, which the UI supplies itself.
+ */
+internal fun trackLanguageOf(description: String?): String {
+    val text = description?.trim().orEmpty()
+    val open = text.lastIndexOf('[')
+    val close = text.lastIndexOf(']')
+    return if (open in 0 until close) text.substring(open + 1, close).trim() else text
+}
+
+private fun TrackDescription.asAudioTrack() = AudioTrack(
+    label = description()?.trim().orEmpty(),
+    language = trackLanguageOf(description()),
+    id = id().toString(),
+)
+
+/**
+ * [SubtitleTrack.src] is a URL for an external subtitle file; an embedded subpicture track has none,
+ * so it carries libVLC's elementary-stream id instead — the handle `selectSubtitleTrack` hands back
+ * to `subpictures().setTrack`. Nothing in this backend fetches `src`: libVLC's own video output
+ * blends the subpictures into the frame.
+ */
+private fun TrackDescription.asSubtitleTrack() = SubtitleTrack(
+    label = description()?.trim().orEmpty(),
+    language = trackLanguageOf(description()),
+    src = id().toString(),
+)
 
 /**
  * A [VideoPlayerState] backed by the **bundled** libVLC, so containers/codecs a platform backend can't
@@ -121,16 +158,89 @@ class VlcVideoPlayerState : VideoPlayerState {
             ioScope.launch { player.submit { player.controls().setRate(v) } }
         }
 
-    // --- Subtitles: stubbed (no track picker exposed yet) ---
+    // --- Tracks ---
+    //
+    // Both lists are read back from libVLC rather than remembered from what we asked for: the
+    // demuxer is the only thing that knows which elementary streams a stream really carries, and on
+    // a live HLS feed they appear after playback has started (see [refreshTracks]).
+    //
+    // Subtitles are libVLC's *subpictures*, blended into the video buffer by the video output
+    // itself — nothing in this backend has to draw them, which is why `subtitleTextStyle` /
+    // `subtitleBackgroundColor` below stay decorative here.
+
+    private val _audioTracks = mutableStateOf<List<AudioTrack>>(emptyList())
+    override val availableAudioTracks: List<AudioTrack> get() = _audioTracks.value
+    override var currentAudioTrack: AudioTrack? by mutableStateOf(null)
+
     override var subtitlesEnabled: Boolean by mutableStateOf(false)
     override var currentSubtitleTrack: SubtitleTrack? by mutableStateOf(null)
-    override val availableSubtitleTracks: MutableList<SubtitleTrack> = mutableListOf()
+    // Observable list: the track panel is recomposed by it appearing, seconds after the stream opened.
+    override val availableSubtitleTracks: MutableList<SubtitleTrack> = mutableStateListOf()
     override var subtitleTextStyle: TextStyle by mutableStateOf(
         TextStyle(color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Normal, textAlign = TextAlign.Center)
     )
     override var subtitleBackgroundColor: Color by mutableStateOf(Color.Black.copy(alpha = 0.5f))
-    override fun selectSubtitleTrack(track: SubtitleTrack?) { currentSubtitleTrack = track; subtitlesEnabled = track != null }
-    override fun disableSubtitles() { subtitlesEnabled = false; currentSubtitleTrack = null }
+
+    override fun selectAudioTrack(track: AudioTrack?) {
+        val id = track?.id?.toIntOrNull() ?: return
+        currentAudioTrack = track
+        ioScope.launch { player.audio().setTrack(id) }
+    }
+
+    override fun selectSubtitleTrack(track: SubtitleTrack?) {
+        if (track == null) {
+            disableSubtitles()
+            return
+        }
+        currentSubtitleTrack = track
+        subtitlesEnabled = true
+        val id = track.src.toIntOrNull() ?: return
+        ioScope.launch { player.subpictures().setTrack(id) }
+    }
+
+    override fun disableSubtitles() {
+        subtitlesEnabled = false
+        currentSubtitleTrack = null
+        ioScope.launch { player.subpictures().setTrack(TRACK_DISABLED) }
+    }
+
+    /**
+     * Re-reads both track lists from libVLC. Called on every event that can change them — the
+     * lists are empty until the media is playing, and HLS renditions keep arriving after that.
+     *
+     * Runs off [ioScope]: these are native calls, and vlcj forbids re-entering the player from the
+     * thread its own events are dispatched on.
+     */
+    private fun refreshTracks() {
+        ioScope.launch {
+            val audio = runCatching { player.audio().trackDescriptions() }.getOrNull().orEmpty()
+            val audioId = runCatching { player.audio().track() }.getOrDefault(TRACK_DISABLED)
+            val subtitles = runCatching { player.subpictures().trackDescriptions() }.getOrNull().orEmpty()
+            val subtitleId = runCatching { player.subpictures().track() }.getOrDefault(TRACK_DISABLED)
+
+            // libVLC prepends its own "Disable" entry (id -1) to both lists. It is not a rendition;
+            // turning subtitles off is `disableSubtitles()`, and the UI renders its own row for it.
+            val audioTracks = audio.filter { it.id() >= 0 }.map { it.asAudioTrack() }
+            val subtitleTracks = subtitles.filter { it.id() >= 0 }.map { it.asSubtitleTrack() }
+
+            onUi {
+                _audioTracks.value = audioTracks
+                currentAudioTrack = audioTracks.firstOrNull { it.id == audioId.toString() }
+                availableSubtitleTracks.clear()
+                availableSubtitleTracks.addAll(subtitleTracks)
+                currentSubtitleTrack = subtitleTracks.firstOrNull { it.src == subtitleId.toString() }
+                subtitlesEnabled = currentSubtitleTrack != null
+            }
+        }
+    }
+
+    private fun clearTracks() {
+        _audioTracks.value = emptyList()
+        currentAudioTrack = null
+        availableSubtitleTracks.clear()
+        currentSubtitleTrack = null
+        subtitlesEnabled = false
+    }
 
     init {
         val bufferFormatCallback = object : BufferFormatCallback {
@@ -145,7 +255,15 @@ class VlcVideoPlayerState : VideoPlayerState {
             VlcNativeInit.factory().videoSurfaces().newVideoSurface(bufferFormatCallback, renderCallback, true)
         )
         player.events().addMediaPlayerEventListener(object : MediaPlayerEventAdapter() {
-            override fun playing(mp: MediaPlayer) = onUi { hasMedia = true; isPlaying = true; isLoading = false; error = null }
+            override fun playing(mp: MediaPlayer) = onUi {
+                hasMedia = true; isPlaying = true; isLoading = false; error = null
+                refreshTracks()
+            }
+            // The elementary streams of an HLS feed are announced one by one, after `playing` — the
+            // second audio rendition of a bilingual channel typically lands a beat later.
+            override fun elementaryStreamAdded(mp: MediaPlayer, type: TrackType, id: Int) = refreshTracks()
+            override fun elementaryStreamDeleted(mp: MediaPlayer, type: TrackType, id: Int) = refreshTracks()
+            override fun elementaryStreamSelected(mp: MediaPlayer, type: TrackType, id: Int) = refreshTracks()
             override fun paused(mp: MediaPlayer) = onUi { isPlaying = false }
             override fun stopped(mp: MediaPlayer) = onUi { isPlaying = false }
             override fun buffering(mp: MediaPlayer, newCache: Float) = onUi { if (isPlaying) isLoading = newCache < 100f }
@@ -248,6 +366,9 @@ class VlcVideoPlayerState : VideoPlayerState {
         // scale the bar against the wrong movie until the first lengthChanged arrives.
         lengthMs = 0L
         metadata.duration = null
+        // Same reason for the track lists: the previous media's renditions are not this one's, and
+        // offering them would let the user pick an id the new demuxer has never heard of.
+        clearTracks()
         sliderPos = 0f
         _positionText.value = formatTime(0.0)
         _durationText.value = formatTime(0.0)

@@ -112,6 +112,35 @@ interface VideoPlayerState {
     // Metadata
     val metadata: VideoMetadata
 
+    // Audio track management
+    //
+    // These three members carry default implementations on purpose: a backend that has not wired
+    // audio-track selection yet compiles untouched and reports "no choice available", which is
+    // exactly the behaviour it had before they existed. Making them abstract would force every
+    // backend (macOS, Windows, Linux, Android, iOS, web) to be edited in the same commit just to
+    // keep compiling, turning a focused change into a rewrite. The cost — a backend can silently do
+    // nothing — is absorbed by the UI, which hides its track control when the list is empty.
+    // See docs/adr/0028-videoplayerstate-defaulted-members.md in the Okamp.tv repository.
+
+    /**
+     * Audio renditions of the media currently open, empty when the backend cannot enumerate them or
+     * the media carries a single one. Only populated once playback has actually started — a demuxer
+     * knows nothing about its elementary streams before then.
+     */
+    val availableAudioTracks: List<AudioTrack> get() = emptyList()
+
+    /**
+     * The audio rendition being played, or `null` when unknown (which is what a backend that does
+     * not implement audio-track selection always reports).
+     */
+    val currentAudioTrack: AudioTrack? get() = null
+
+    /**
+     * Switches playback to [track], which must be one of [availableAudioTracks]. A `null` track, or
+     * any call on a backend that has not implemented selection, is a no-op.
+     */
+    fun selectAudioTrack(track: AudioTrack?) {}
+
     // Subtitle management
     var subtitlesEnabled: Boolean
     var currentSubtitleTrack: SubtitleTrack?
@@ -174,6 +203,8 @@ data class PreviewableVideoPlayerState(
     override val aspectRatio: Float = 1.7f,
     override val error: VideoPlayerError? = null,
     override val metadata: VideoMetadata = VideoMetadata(),
+    override val availableAudioTracks: List<AudioTrack> = emptyList(),
+    override val currentAudioTrack: AudioTrack? = null,
     override var subtitlesEnabled: Boolean = false,
     override var currentSubtitleTrack: SubtitleTrack? = null,
     override val availableSubtitleTracks: MutableList<SubtitleTrack> = emptyList<SubtitleTrack>().toMutableList(),
