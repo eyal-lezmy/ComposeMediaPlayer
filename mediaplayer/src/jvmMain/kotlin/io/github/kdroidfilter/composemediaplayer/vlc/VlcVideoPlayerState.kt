@@ -276,16 +276,42 @@ class VlcVideoPlayerState : VideoPlayerState {
                 if (userDragging) return@onUi
                 _positionText.value = formatTime(newTime / 1000.0)
                 // A length the playhead has already passed is a pre-parse/under-reported one: ask
-                // libVLC again rather than scale by it. Until a plausible length exists the bar
-                // simply holds — an honest "unknown" beats racing to the end.
+                // libVLC again rather than scale by it.
                 if (lengthMs <= newTime) updateLength(player.status().length())
-                if (lengthMs > newTime) {
-                    sliderPos = (newTime.toFloat() / lengthMs * SLIDER_SCALE).coerceIn(0f, SLIDER_SCALE)
+                sliderPos = if (lengthMs > newTime) {
+                    (newTime.toFloat() / lengthMs * SLIDER_SCALE).coerceIn(0f, SLIDER_SCALE)
+                } else {
+                    // No usable length: libVLC publishes none for an MPEG-TS served over HTTP byte
+                    // ranges (an Xtream Codes catch-up window, measured 2026-08-02 — `length()` stays
+                    // 0 for the whole replay while `isSeekable` is true and seeking works). Scaling
+                    // by that 0 is a division the branch above simply skipped, which left the bar
+                    // pinned wherever it was last written and made the playhead unreadable.
+                    //
+                    // `position()` is the demuxer's own 0..1 progress, maintained from the byte
+                    // offset and independent of any duration — measured accurate to 0.1% of the
+                    // permille asked for on exactly that media, so it is the right fallback rather
+                    // than a guess. The bar becomes usable; `durationText` stays "00:00", honestly
+                    // reporting that nobody knows the length.
+                    (player.status().position() * SLIDER_SCALE).coerceIn(0f, SLIDER_SCALE)
                 }
             }
             override fun finished(mp: MediaPlayer) = onUi {
-                if (loop) ioScope.launch { player.submit { player.controls().setPosition(0f); player.controls().play() } }
-                else { isPlaying = false; sliderPos = SLIDER_SCALE }
+                if (loop) {
+                    ioScope.launch { player.submit { player.controls().setPosition(0f); player.controls().play() } }
+                } else {
+                    isPlaying = false
+                    // Pinning the bar to the end is only right when a length is known. Without one
+                    // this event is not trustworthy as "the media ran out": on an HTTP byte-range
+                    // MPEG-TS it also fires when a seek drops the connection mid-stream, and pinning
+                    // then threw the playhead to the far right seconds after the user had put it in
+                    // the middle (measured 2026-08-02).
+                    //
+                    // Nothing is lost by not pinning: sliderPos is driven by `position()` in that
+                    // case, and a media that genuinely reached its end left it at ~1.0 already,
+                    // while one whose connection died left it where playback actually stopped. The
+                    // bar keeps telling those two apart instead of reporting both as "finished".
+                    if (lengthMs > 0) sliderPos = SLIDER_SCALE
+                }
             }
         })
     }
