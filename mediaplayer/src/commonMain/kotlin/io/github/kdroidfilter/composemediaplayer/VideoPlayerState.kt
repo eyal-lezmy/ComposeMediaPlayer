@@ -126,6 +126,11 @@ interface VideoPlayerState {
      * Audio renditions of the media currently open, empty when the backend cannot enumerate them or
      * the media carries a single one. Only populated once playback has actually started — a demuxer
      * knows nothing about its elementary streams before then.
+     *
+     * Implemented by the desktop libVLC backend and the Android Media3 one. **iOS still reports the
+     * default empty list**: its backend is AVFoundation until MobileVLCKit is ported to it, so the
+     * UI's track control is simply never drawn there — which is the ADR 0028 contract working as
+     * intended, not an omission to fix in passing.
      */
     val availableAudioTracks: List<AudioTrack> get() = emptyList()
 

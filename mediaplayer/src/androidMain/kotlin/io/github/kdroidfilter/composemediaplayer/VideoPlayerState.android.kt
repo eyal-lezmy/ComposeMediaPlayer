@@ -10,6 +10,7 @@ import androidx.compose.runtime.Stable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableDoubleStateOf
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.graphics.Color
@@ -105,10 +106,26 @@ open class DefaultVideoPlayerState: VideoPlayerState {
     private var _metadata = VideoMetadata()
     override val metadata: VideoMetadata get() = _metadata
 
+    // --- Tracks ---
+    //
+    // Both lists are read back from ExoPlayer's own `currentTracks` rather than remembered from what
+    // was asked for: the extractor is the only thing that knows what the media really carries, and
+    // on an HLS feed the renditions appear after playback has started (see [refreshTracks]).
+    //
+    // A track's handle is its position in `currentTracks` — "<group>:<index>" — because Media3
+    // selects by `TrackSelectionOverride(mediaTrackGroup, index)` and nothing else identifies a
+    // group across calls. The pair is only ever resolved against the very list the UI was handed,
+    // which [refreshTracks] republishes on every `onTracksChanged`, so it cannot go stale unnoticed.
+
+    private var _audioTracks by mutableStateOf<List<AudioTrack>>(emptyList())
+    override val availableAudioTracks: List<AudioTrack> get() = _audioTracks
+    override var currentAudioTrack by mutableStateOf<AudioTrack?>(null)
+
     // Subtitle state
     override var subtitlesEnabled by mutableStateOf(false)
     override var currentSubtitleTrack by mutableStateOf<SubtitleTrack?>(null)
-    override val availableSubtitleTracks = mutableListOf<SubtitleTrack>()
+    // Observable list: the track panel is recomposed by it appearing, seconds after the media opened.
+    override val availableSubtitleTracks: MutableList<SubtitleTrack> = mutableStateListOf()
     override var subtitleTextStyle by mutableStateOf(
         TextStyle(
             color = Color.White,
@@ -122,24 +139,26 @@ open class DefaultVideoPlayerState: VideoPlayerState {
 
     private var playerView: PlayerView? = null
 
-    // Select an external subtitle track
+    override fun selectAudioTrack(track: AudioTrack?) {
+        val override = track?.let { trackOverride(C.TRACK_TYPE_AUDIO, it.id) } ?: return
+        currentAudioTrack = track
+        applyOverride(C.TRACK_TYPE_AUDIO, override)
+    }
+
     override fun selectSubtitleTrack(track: SubtitleTrack?) {
         if (track == null) {
             disableSubtitles()
             return
         }
+        val override = trackOverride(C.TRACK_TYPE_TEXT, track.src) ?: return
 
         currentSubtitleTrack = track
         subtitlesEnabled = true
 
-        exoPlayer?.let { player ->
-            val trackParameters = player.trackSelectionParameters.buildUpon()
-                .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
-                .build()
-            player.trackSelectionParameters = trackParameters
-
-            playerView?.subtitleView?.visibility = android.view.View.GONE
-        }
+        // The type has to be re-enabled as well as overridden: disableSubtitles() left it disabled,
+        // and an override on a disabled track type selects nothing.
+        applyOverride(C.TRACK_TYPE_TEXT, override, disabled = false)
+        playerView?.subtitleView?.visibility = android.view.View.VISIBLE
     }
 
     override fun disableSubtitles() {
@@ -149,12 +168,92 @@ open class DefaultVideoPlayerState: VideoPlayerState {
         exoPlayer?.let { player ->
             val parameters = player.trackSelectionParameters.buildUpon()
                 .setPreferredTextLanguage(null)
+                .clearOverridesOfType(C.TRACK_TYPE_TEXT)
                 .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
                 .build()
             player.trackSelectionParameters = parameters
 
             playerView?.subtitleView?.visibility = android.view.View.GONE
         }
+    }
+
+    /**
+     * Resolves a handle produced by [refreshTracks] back into the Media3 override that selects it,
+     * or null when the media changed under it — a stale handle must be a no-op, never a crash.
+     */
+    private fun trackOverride(trackType: Int, handle: String): TrackSelectionOverride? {
+        val player = exoPlayer ?: return null
+        if (isPlayerReleased) return null
+        val (groupIndex, trackIndex) = handle.split(':')
+            .takeIf { it.size == 2 }
+            ?.let { (group, track) -> (group.toIntOrNull() ?: return null) to (track.toIntOrNull() ?: return null) }
+            ?: return null
+        val group = player.currentTracks.groups.getOrNull(groupIndex) ?: return null
+        if (group.type != trackType || trackIndex !in 0 until group.length) return null
+        return TrackSelectionOverride(group.mediaTrackGroup, trackIndex)
+    }
+
+    private fun applyOverride(trackType: Int, override: TrackSelectionOverride, disabled: Boolean = false) {
+        val player = exoPlayer ?: return
+        player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
+            .setTrackTypeDisabled(trackType, disabled)
+            .setOverrideForType(override)
+            .build()
+    }
+
+    /**
+     * Re-reads both track lists from ExoPlayer. Called on every `onTracksChanged`, which is the only
+     * moment the extractor has anything to say: the lists are empty until the media is prepared, and
+     * HLS renditions keep arriving after playback has started.
+     *
+     * `isSelected` is read back rather than remembered, so a track the player picked by itself —
+     * which is every track before the user touches the panel — is the one the UI shows as current.
+     */
+    private fun refreshTracks() {
+        val player = exoPlayer ?: return
+        if (isPlayerReleased) return
+
+        val audio = mutableListOf<AudioTrack>()
+        var selectedAudio: AudioTrack? = null
+        val subtitles = mutableListOf<SubtitleTrack>()
+        var selectedSubtitle: SubtitleTrack? = null
+
+        player.currentTracks.groups.forEachIndexed { groupIndex, group ->
+            for (trackIndex in 0 until group.length) {
+                val format = group.getTrackFormat(trackIndex)
+                val handle = "$groupIndex:$trackIndex"
+                val language = format.language.orEmpty()
+                val label = format.label ?: language
+                when (group.type) {
+                    C.TRACK_TYPE_AUDIO -> {
+                        val track = AudioTrack(label = label, language = language, id = handle)
+                        audio += track
+                        if (group.isTrackSelected(trackIndex)) selectedAudio = track
+                    }
+
+                    C.TRACK_TYPE_TEXT -> {
+                        val track = SubtitleTrack(label = label, language = language, src = handle)
+                        subtitles += track
+                        if (group.isTrackSelected(trackIndex)) selectedSubtitle = track
+                    }
+                }
+            }
+        }
+
+        _audioTracks = audio
+        currentAudioTrack = selectedAudio
+        availableSubtitleTracks.clear()
+        availableSubtitleTracks.addAll(subtitles)
+        currentSubtitleTrack = selectedSubtitle
+        subtitlesEnabled = selectedSubtitle != null
+    }
+
+    private fun clearTracks() {
+        _audioTracks = emptyList()
+        currentAudioTrack = null
+        availableSubtitleTracks.clear()
+        currentSubtitleTrack = null
+        subtitlesEnabled = false
     }
 
     internal fun attachPlayerView(view: PlayerView?) {
@@ -410,6 +509,11 @@ open class DefaultVideoPlayerState: VideoPlayerState {
                     _isLoading = false
                 }
             }
+        }
+
+        override fun onTracksChanged(tracks: Tracks) {
+            if (isPlayerReleased) return
+            refreshTracks()
         }
 
         override fun onIsPlayingChanged(playing: Boolean) {
@@ -713,6 +817,9 @@ open class DefaultVideoPlayerState: VideoPlayerState {
         _aspectRatio = 16f / 9f
         _playbackSpeed = 1.0f
         _metadata = VideoMetadata()
+        // The next media's tracks are a different set, and onTracksChanged is what publishes them —
+        // leaving the previous title's list up would offer renditions that no longer exist.
+        clearTracks()
         exoPlayer?.playbackParameters = PlaybackParameters(_playbackSpeed)
         if (!keepMedia) {
             _hasMedia = false
