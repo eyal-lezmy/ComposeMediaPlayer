@@ -4,6 +4,9 @@ import com.sun.jna.Library
 import com.sun.jna.Native
 import io.github.kdroidfilter.composemediaplayer.util.buildLocalLogger
 import uk.co.caprica.vlcj.factory.MediaPlayerFactory
+import uk.co.caprica.vlcj.log.LogEventListener
+import uk.co.caprica.vlcj.log.LogLevel
+import uk.co.caprica.vlcj.log.NativeLog
 import java.io.File
 import java.net.JarURLConnection
 import java.nio.file.Files
@@ -30,8 +33,48 @@ object VlcNativeInit {
     @Volatile
     private var factory: MediaPlayerFactory? = null
 
-    /** libVLC args: quiet, and skip the on-disk plugins cache (we scan VLC_PLUGIN_PATH directly). */
-    private val factoryArgs = arrayOf("--quiet", "--no-plugins-cache", "--no-video-title-show")
+    /**
+     * Receives libVLC's own log messages as `(level, module, message)` — set it **before** the first
+     * playback, since it decides how the shared factory is created.
+     *
+     * libVLC is the only component that knows why a stream stopped: the player API reports a frozen
+     * picture and a silent state, while the log says `http: connection failed` or
+     * `vout: picture is too late` in as many words. Nothing here reads it; the host application
+     * decides what to do with the lines.
+     */
+    @Volatile
+    var nativeLogListener: ((String, String, String) -> Unit)? = null
+
+    /**
+     * libVLC args: skip the on-disk plugins cache (we scan VLC_PLUGIN_PATH directly), no title OSD.
+     *
+     * Verbosity is decided by [nativeLogListener]: `--quiet` sets libVLC's verbosity to -1, which
+     * drops messages *before* they reach any log callback, so a listener has to be paired with
+     * `--verbose`. Without one, stay quiet — the messages would only go to stderr.
+     *
+     * `--verbose=1` (errors and warnings), not `2`: the verbosity argument is libVLC's *only*
+     * filter, so debug level would push thousands of messages a minute through a JNA callback while
+     * video is decoding — perturbing the frame timing that a stall investigation is measuring. The
+     * failures worth catching announce themselves at those two levels (`connection failed`,
+     * `picture is too late`).
+     */
+    private val factoryArgs: Array<String>
+        get() = listOfNotNull(
+            if (nativeLogListener != null) "--verbose=1" else "--quiet",
+            "--no-plugins-cache",
+            "--no-video-title-show",
+            httpProxy()?.let { "--http-proxy=$it" },
+        ).toTypedArray()
+
+    /**
+     * Opt-in diagnostic proxy (e.g. `tools/http_probe_proxy.py`), read from `OKAMP_VLC_HTTP_PROXY`.
+     *
+     * An **instance** argument, not a per-media `:http-proxy=` option: passed per media it was
+     * accepted without complaint and then ignored — the proxy saw no connection at all while
+     * playback ran normally (measured 2026-08-16). Off unless the environment asks for it, so
+     * nothing ships behind a proxy by accident.
+     */
+    private fun httpProxy(): String? = System.getenv("OKAMP_VLC_HTTP_PROXY")?.takeIf { it.isNotBlank() }
 
     /** Shared factory, initialised once. Throws with an actionable message if natives are missing. */
     fun factory(): MediaPlayerFactory =
@@ -62,7 +105,47 @@ object VlcNativeInit {
         }
 
         vlcLogger.d { "libVLC natives ready at $dir" }
-        return MediaPlayerFactory(*factoryArgs)
+        return MediaPlayerFactory(*factoryArgs).also(::attachNativeLog)
+    }
+
+    /**
+     * The log and the listener bridging it to [nativeLogListener], kept for the life of the process.
+     *
+     * **Load-bearing references, not tidiness.** JNA allocates a native trampoline for the listener
+     * and keeps only a weak reference to it: once nothing on the Java side holds the listener, the
+     * GC frees that trampoline while libVLC still holds its address, and the next message crashes
+     * inside `vlc_vaLog` — measured 2026-08-16, `EXC_BAD_ACCESS … possible pointer authentication
+     * failure`, about 20 s into playback, with the whole stack in `libvlccore` → `jna…tmp`.
+     */
+    private var nativeLog: NativeLog? = null
+    private var nativeLogBridge: LogEventListener? = null
+
+    /**
+     * Forwards libVLC's messages to [nativeLogListener], from `WARNING` up — matching the
+     * `--verbose=1` the factory was built with, so nothing is generated only to be dropped here.
+     *
+     * The listener is called on libVLC's own logging thread, in the middle of whatever module is
+     * emitting: it must return immediately and must not throw back into native code.
+     */
+    private fun attachNativeLog(factory: MediaPlayerFactory) {
+        val listener = nativeLogListener ?: return
+        try {
+            val log = factory.application().newLog() ?: return
+            val bridge = LogEventListener { level, module, _, _, _, _, _, message ->
+                try {
+                    listener(level?.name ?: "?", module ?: "?", message?.trim().orEmpty())
+                } catch (_: Throwable) {
+                    // An exception crossing back into libVLC's logging thread would take the
+                    // process down for a diagnostic line. Losing the line is the cheaper failure.
+                }
+            }
+            log.setLevel(LogLevel.WARNING)
+            log.addLogListener(bridge)
+            nativeLog = log
+            nativeLogBridge = bridge
+        } catch (e: Throwable) {
+            vlcLogger.e { "could not attach the libVLC log: ${e.message}" }
+        }
     }
 
     /** Extract the vendored libs + plugins for this platform to a stable cache dir (idempotent). */

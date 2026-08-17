@@ -23,7 +23,10 @@ import io.github.kdroidfilter.composemediaplayer.util.formatTime
 import io.github.vinceglb.filekit.PlatformFile
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import org.jetbrains.skia.Bitmap
 import org.jetbrains.skia.ColorAlphaType
@@ -45,6 +48,36 @@ import java.nio.ByteBuffer
  * every other backend in this library reports it (the interface KDoc's `0f..1f` is stale).
  */
 private const val SLIDER_SCALE = 1000f
+
+/**
+ * How often libVLC's own counters are sampled while diagnostics are on. Two seconds keeps the trace
+ * readable across a minute-long incident while still bracketing a stop to within one sample.
+ */
+private const val STATS_SAMPLE_MILLIS = 2_000L
+
+/**
+ * How often a *healthy* stream writes a counter line. The sampler still looks every
+ * [STATS_SAMPLE_MILLIS], so the instant input stops is still caught within two seconds; this only
+ * governs the heartbeat, which is what would otherwise fill the file during normal playback.
+ */
+private const val STATS_REPORT_MILLIS = 30_000L
+
+/**
+ * Per-media options for [VlcVideoPlayerState.openUri]. Empty today, and deliberately documented as
+ * such: two plausible options were measured against an Xtream Codes catch-up archive whose input
+ * stopped after 16-21 MB on every seeked replay, and **neither did anything**.
+ *
+ * - `:http-reconnect` — no reconnection ever happened: four dead sessions, zero resumed reads.
+ * - `:prefetch-buffer-size=65536` — the 16 MiB default sat exactly where the input stopped, which
+ *   looked conclusive; at 64 MiB the next replays still died at 13.0 MB and 20.3 MB. The option was
+ *   accepted (no "option does not exist"), so the experiment did run.
+ *
+ * The real cause was on the application's side: a second connection (an availability probe) against
+ * an account the panel limits to one, which the CDN answered by closing the stream — a packet
+ * capture shows the `FIN` coming from the server while that probe was open. Nothing in libVLC's
+ * options addresses that, which is why this list is empty rather than hopeful.
+ */
+private fun mediaOptionsFor(uri: String): Array<String> = emptyArray()
 
 /** libVLC's "no track" id: what `setTrack` takes to turn a track off, and what `track()` reads back then. */
 private const val TRACK_DISABLED = -1
@@ -406,11 +439,74 @@ class VlcVideoPlayerState : VideoPlayerState {
         sliderPos = 0f
         _positionText.value = formatTime(0.0)
         _durationText.value = formatTime(0.0)
+        startStatsSampling()
         ioScope.launch {
             player.audio().setVolume((_volume.value * 100).toInt())
-            val ok = player.media().play(uri)
+            val ok = player.media().play(uri, *mediaOptionsFor(uri))
             if (!ok) onUi { isLoading = false; error = VideoPlayerError.SourceError("Failed to open: $uri") }
             else if (initializeplayerState == InitialPlayerState.PAUSE) player.submit { player.controls().setPause(true) }
+        }
+    }
+
+    /**
+     * Samples libVLC's own input/demux/vout counters into [VlcNativeInit.nativeLogListener], while a
+     * media is open and only when a listener is installed.
+     *
+     * These numbers answer the one question the player API cannot: when playback stops, had the
+     * bytes stopped arriving *first*? A stream the server closed shows `read` flat while pictures
+     * keep being displayed from the buffer; a pipeline stuck behind its own video output shows both
+     * flat with `lost` climbing. libVLC reports a clean end-of-stream identically in both cases —
+     * `playing=false`, no error, no log line (measured 2026-08-16).
+     */
+    private var statsJob: Job? = null
+
+    private fun startStatsSampling() {
+        statsJob?.cancel()
+        val report = VlcNativeInit.nativeLogListener ?: return
+        statsJob = ioScope.launch {
+            var lastInput = 0
+            var lastDemux = 0
+            var lastShown = 0
+            var lastLost = 0
+            var millisSinceReport = 0L
+            var wasStalled = false
+            while (isActive) {
+                delay(STATS_SAMPLE_MILLIS)
+                millisSinceReport += STATS_SAMPLE_MILLIS
+                val stats = runCatching { player.media().info()?.statistics() }.getOrNull() ?: continue
+                val input = stats.inputBytesRead()
+                val demux = stats.demuxBytesRead()
+                val shown = stats.picturesDisplayed()
+                val lost = stats.picturesLost()
+                val readDelta = input - lastInput
+                val stalled = readDelta == 0
+                // Sampled at [STATS_SAMPLE_MILLIS] but only *written* when it says something: the
+                // heartbeat, the moment input stops, the moment it comes back, or dropped pictures.
+                // A stream that simply works costs one line every [STATS_REPORT_MILLIS].
+                val notable = stalled != wasStalled || lost > lastLost
+                if (notable || millisSinceReport >= STATS_REPORT_MILLIS) {
+                    val prefix = when {
+                        stalled && !wasStalled -> "INPUT STOPPED "
+                        !stalled && wasStalled -> "input resumed "
+                        else -> ""
+                    }
+                    report(
+                        "STATS",
+                        "input",
+                        prefix +
+                            "read=+${readDelta}B bitrate=${(stats.inputBitrate() * 8000).toInt()}kbps " +
+                            "demux=+${demux - lastDemux}B corrupt=${stats.demuxCorrupted()} " +
+                            "disc=${stats.demuxDiscontinuity()} shown=+${shown - lastShown} " +
+                            "lost=+${lost - lastLost}",
+                    )
+                    millisSinceReport = 0L
+                }
+                wasStalled = stalled
+                lastInput = input
+                lastDemux = demux
+                lastShown = shown
+                lastLost = lost
+            }
         }
     }
 
@@ -431,6 +527,8 @@ class VlcVideoPlayerState : VideoPlayerState {
     override fun clearError() { error = null }
 
     override fun dispose() {
+        // Before the player is released: the sampler reads through it.
+        statsJob?.cancel()
         uiScope.launch { isPlaying = false; hasMedia = false; _currentFrame.value = null }
         ioScope.launch {
             try { player.controls().stop() } catch (_: Throwable) {}
