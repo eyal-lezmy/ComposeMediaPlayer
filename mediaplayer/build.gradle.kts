@@ -124,6 +124,9 @@ kotlin {
             implementation(kotlin("test"))
             implementation(kotlin("test-junit"))
             implementation(libs.kotlinx.coroutines.test)
+            // Skia's native binary for this host: PlanarFrameShaderTest renders real pixels through
+            // the YUV shader, and skiko throws LibraryLoadException without it.
+            implementation(compose.desktop.currentOs)
         }
 
         iosMain.dependencies {

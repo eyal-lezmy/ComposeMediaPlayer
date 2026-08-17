@@ -35,17 +35,45 @@ fun VlcVideoPlayerSurface(
         // black behind it rather than decoding the same picture into two canvases.
         if (playerState.hasMedia && (!playerState.isFullscreen || isInFullscreenWindow)) {
             val currentFrame by remember(playerState) { playerState.currentFrameState }
+            val planarFrame by remember(playerState) { playerState.currentPlanarFrameState }
+            val canvasModifier = contentScale.toCanvasModifier(
+                playerState.aspectRatio, playerState.metadata.width, playerState.metadata.height
+            )
             currentFrame?.let { frame ->
-                Canvas(
-                    modifier = contentScale.toCanvasModifier(
-                        playerState.aspectRatio, playerState.metadata.width, playerState.metadata.height
-                    ),
-                ) {
+                Canvas(modifier = canvasModifier) {
                     drawScaledImage(
                         image = frame,
                         dstSize = IntSize(size.width.toInt(), size.height.toInt()),
                         contentScale = contentScale,
                     )
+                }
+            }
+            // Planar frames carry the captions libVLC drew into them (ADR 0041); they are recombined
+            // on the GPU rather than converted to BGRA on a libVLC thread.
+            planarFrame?.let { frame ->
+                Canvas(modifier = canvasModifier) {
+                    with(PlanarFrameShader) {
+                        if (contentScale == ContentScale.Crop) {
+                            // Cover the canvas, then sample only the part of the frame that fits it —
+                            // the same central crop `drawScaledImage` performs for packed frames.
+                            val scale = maxOf(
+                                size.width / frame.width, size.height / frame.height,
+                            )
+                            val srcW = (size.width / scale).coerceAtMost(frame.width.toFloat())
+                            val srcH = (size.height / scale).coerceAtMost(frame.height.toFloat())
+                            drawPlanarFrame(
+                                frame = frame,
+                                dstWidth = size.width,
+                                dstHeight = size.height,
+                                srcLeft = (frame.width - srcW) / 2f,
+                                srcTop = (frame.height - srcH) / 2f,
+                                srcWidth = srcW,
+                                srcHeight = srcH,
+                            )
+                        } else {
+                            drawPlanarFrame(frame, size.width, size.height)
+                        }
+                    }
                 }
             }
         }

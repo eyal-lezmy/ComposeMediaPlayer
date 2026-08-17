@@ -83,6 +83,21 @@ private fun mediaOptionsFor(uri: String): Array<String> = emptyArray()
 private const val TRACK_DISABLED = -1
 
 /**
+ * How much bigger than the source the planar buffer is asked for.
+ *
+ * libVLC blends subpictures *before* the display conversion whenever the display format is no larger
+ * than the source (`video_output.c:1008`, `do_early_spu`), and that early blend cannot write into a
+ * hardware picture. Two pixels are enough to fail that test and move the blend after the conversion,
+ * where the caption lands in the frame we are handed. See ADR 0041.
+ *
+ * **This is a libVLC 3 heuristic, not an API contract.** libVLC 4 replaced that expression with one
+ * that has no size term, so the margin buys nothing there and captions disappear silently. Before
+ * bumping libVLC, read `docs/tasks/pending/153-libvlc-4-migration.md` — and trust
+ * `VmemSubtitleProbeTest`, which fails on a frame rather than on a hunch.
+ */
+private const val SPU_BLEND_MARGIN_PX = 2
+
+/**
  * Language libVLC advertises for a track. Its descriptions read `"Track 1 - [English]"`, or plainly
  * `"English"` when the demuxer only knows a name — the bracketed part, when there is one, is the
  * language and the rest is libVLC's own numbering, which the UI supplies itself.
@@ -119,8 +134,36 @@ private fun TrackDescription.asSubtitleTrack() = SubtitleTrack(
  * an [ImageBitmap] for [VlcVideoPlayerSurface] to draw. Playback/UI state is driven off libVLC events,
  * not polling.
  */
+/**
+ * What the callback surface asks libVLC to hand it.
+ *
+ * [Packed] is BGRA at the source's own size — the long-standing shape, and the one where **libVLC
+ * never draws subtitles**: a buffer the size of the source makes libVLC blend subpictures into the
+ * *source* chroma, which under VideoToolbox is an opaque `CVPX` surface it has no blending routine
+ * for, so the caption is dropped (docs/adr/0041-subtitles-blend-into-an-i420-surface.md).
+ *
+ * [Planar] asks for I420 slightly **larger** than the source. The extra pixels move the blend after
+ * the display conversion, into a chroma `blend` can write to, so captions reach the frame; asking for
+ * I420 rather than BGRA keeps libVLC on its plane-to-plane conversion route, which is what makes 4K
+ * 10-bit hold full frame rate (24.0 fps / 0 lost, against 16.4 fps / 149 lost for a padded BGRA
+ * buffer). Costs a YUV→RGB step, done on the GPU by [VlcVideoPlayerSurface].
+ */
+enum class VlcSurfaceFormat { Packed, Planar }
+
+/** One decoded frame as three 8-bit planes, published by [VlcSurfaceFormat.Planar]. */
 @Stable
-class VlcVideoPlayerState : VideoPlayerState {
+class PlanarFrame(
+    val y: ImageBitmap,
+    val u: ImageBitmap,
+    val v: ImageBitmap,
+    val width: Int,
+    val height: Int,
+)
+
+@Stable
+class VlcVideoPlayerState(
+    private val surfaceFormat: VlcSurfaceFormat = VlcSurfaceFormat.Packed,
+) : VideoPlayerState {
 
     private val player: EmbeddedMediaPlayer =
         VlcNativeInit.factory().mediaPlayers().newEmbeddedMediaPlayer()
@@ -132,9 +175,13 @@ class VlcVideoPlayerState : VideoPlayerState {
     // --- Frame state (surface reads currentFrameState) ---
     private val _currentFrame = mutableStateOf<ImageBitmap?>(null)
     internal val currentFrameState: State<ImageBitmap?> = _currentFrame
+    private val _currentPlanarFrame = mutableStateOf<PlanarFrame?>(null)
+    internal val currentPlanarFrameState: State<PlanarFrame?> = _currentPlanarFrame
     private val frameLock = Any()
     private var bitmapA: Bitmap? = null
     private var bitmapB: Bitmap? = null
+    private var planesA: PlaneSet? = null
+    private var planesB: PlaneSet? = null
     private var useA = true
     private var frameW = 0
     private var frameH = 0
@@ -278,12 +325,30 @@ class VlcVideoPlayerState : VideoPlayerState {
     init {
         val bufferFormatCallback = object : BufferFormatCallback {
             override fun getBufferFormat(sourceWidth: Int, sourceHeight: Int): BufferFormat {
+                // The *source* size, deliberately, even when the buffer asked for is bigger: the
+                // margin exists to move libVLC's subpicture blending, not to change the picture's
+                // shape, and the layout must keep the film's own aspect ratio.
                 onDimensions(sourceWidth, sourceHeight)
-                return RV32BufferFormat(sourceWidth, sourceHeight)
+                if (surfaceFormat == VlcSurfaceFormat.Packed) {
+                    return RV32BufferFormat(sourceWidth, sourceHeight)
+                }
+                // Even dimensions: I420 carries one chroma sample per 2x2 luma block, so an odd
+                // plane size would leave libVLC writing half a sample per row.
+                val w = (sourceWidth + SPU_BLEND_MARGIN_PX + 1) and 1.inv()
+                val h = (sourceHeight + SPU_BLEND_MARGIN_PX + 1) and 1.inv()
+                return BufferFormat(
+                    "I420", w, h,
+                    intArrayOf(w, w / 2, w / 2),
+                    intArrayOf(h, h / 2, h / 2),
+                )
             }
             override fun allocatedBuffers(buffers: Array<ByteBuffer>) {}
         }
-        val renderCallback = RenderCallback { _, buffers, format -> onFrame(buffers[0], format) }
+        val renderCallback = RenderCallback { _, buffers, format ->
+            framesReceived.incrementAndGet()
+            if (surfaceFormat == VlcSurfaceFormat.Packed) onFrame(buffers[0], format)
+            else onPlanarFrame(buffers, format)
+        }
         player.videoSurface().set(
             VlcNativeInit.factory().videoSurfaces().newVideoSurface(bufferFormatCallback, renderCallback, true)
         )
@@ -377,7 +442,6 @@ class VlcVideoPlayerState : VideoPlayerState {
 
     /** Copy the RV32 (BGRA) frame into a double-buffered Skia bitmap and publish it. */
     private fun onFrame(buffer: ByteBuffer, format: BufferFormat) {
-        framesReceived.incrementAndGet()
         val w = format.width; val h = format.height
         if (w <= 0 || h <= 0) return
         try {
@@ -423,6 +487,82 @@ class VlcVideoPlayerState : VideoPlayerState {
         }
         } catch (e: Throwable) {
             vlcLogger.e { "onFrame copy failed (${format.width}x${format.height}, pitch=${format.pitches.getOrNull(0)}): $e" }
+        }
+    }
+
+    /**
+     * Copy an I420 frame — three 8-bit planes, chroma at half resolution — into Skia bitmaps and
+     * publish them for [VlcVideoPlayerSurface] to recombine on the GPU.
+     *
+     * Double-buffered and released-by-dropping for the same reasons as the packed path above: the
+     * published planes are still referenced by composition while the next frame is being written.
+     */
+    private fun onPlanarFrame(buffers: Array<ByteBuffer>, format: BufferFormat) {
+        val w = format.width; val h = format.height
+        if (w <= 0 || h <= 0 || buffers.size < 3) return
+        try {
+            synchronized(frameLock) {
+                if (planesA == null || frameW != w || frameH != h) {
+                    planesA = PlaneSet(w, h)
+                    planesB = PlaneSet(w, h)
+                    frameW = w; frameH = h; useA = true
+                }
+                val target = (if (useA) planesA else planesB) ?: return
+                useA = !useA
+                target.copyFrom(buffers, format)
+                val published = PlanarFrame(
+                    y = target.y.asComposeImageBitmap(),
+                    u = target.u.asComposeImageBitmap(),
+                    v = target.v.asComposeImageBitmap(),
+                    width = w,
+                    height = h,
+                )
+                framesPublished.incrementAndGet()
+                uiScope.launch { _currentPlanarFrame.value = published }
+            }
+        } catch (e: Throwable) {
+            vlcLogger.e { "onPlanarFrame copy failed (${format.width}x${format.height}): $e" }
+        }
+    }
+
+    /** The three Skia bitmaps one I420 frame is copied into. */
+    private class PlaneSet(width: Int, height: Int) {
+        val y = grayBitmap(width, height)
+        val u = grayBitmap(width / 2, height / 2)
+        val v = grayBitmap(width / 2, height / 2)
+
+        fun copyFrom(buffers: Array<ByteBuffer>, format: BufferFormat) {
+            copyPlane(buffers[0], format.pitches[0], y)
+            copyPlane(buffers[1], format.pitches[1], u)
+            copyPlane(buffers[2], format.pitches[2], v)
+        }
+
+        private fun copyPlane(src: ByteBuffer, srcPitch: Int, into: Bitmap) {
+            val pixmap = into.peekPixels() ?: return
+            val addr = pixmap.addr
+            if (addr == 0L) return
+            val dstPitch = pixmap.rowBytes.toInt()
+            val rows = into.height
+            val dst = com.sun.jna.Pointer(addr).getByteBuffer(0, dstPitch.toLong() * rows)
+            src.rewind()
+            if (srcPitch == dstPitch) {
+                // libVLC was given our pitch, so the whole plane is one contiguous copy.
+                dst.put(src)
+                return
+            }
+            val row = ByteArray(minOf(srcPitch, dstPitch))
+            for (line in 0 until rows) {
+                src.position(line * srcPitch)
+                src.get(row, 0, row.size)
+                dst.position(line * dstPitch)
+                dst.put(row)
+            }
+        }
+
+        private companion object {
+            fun grayBitmap(width: Int, height: Int) = Bitmap().apply {
+                allocPixels(ImageInfo(width, height, ColorType.GRAY_8, ColorAlphaType.OPAQUE))
+            }
         }
     }
 
@@ -529,7 +669,10 @@ class VlcVideoPlayerState : VideoPlayerState {
     override fun dispose() {
         // Before the player is released: the sampler reads through it.
         statsJob?.cancel()
-        uiScope.launch { isPlaying = false; hasMedia = false; _currentFrame.value = null }
+        uiScope.launch {
+            isPlaying = false; hasMedia = false
+            _currentFrame.value = null; _currentPlanarFrame.value = null
+        }
         ioScope.launch {
             try { player.controls().stop() } catch (_: Throwable) {}
             try { player.release() } catch (_: Throwable) {}

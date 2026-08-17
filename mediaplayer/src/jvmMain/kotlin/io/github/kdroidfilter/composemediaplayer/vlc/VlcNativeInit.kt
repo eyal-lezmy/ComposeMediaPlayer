@@ -23,6 +23,12 @@ internal val vlcLogger = buildLocalLogger("VlcNativeInit")
  * path — dyld then registers it under its install name `@rpath/libvlccore.dylib`, which satisfies both
  * libvlc and every plugin — point `jna.library.path` at libvlc for vlcj, and `VLC_PLUGIN_PATH` at the
  * plugins so libvlccore finds them without a system VLC.
+ *
+ * **Changing the bundled libVLC version is not a drop-in.** Desktop subtitles reach the picture
+ * through a libVLC 3 behaviour that libVLC 4 removed, and the loss is silent — the player still
+ * reports the subtitle track as selected. Read
+ * `docs/tasks/pending/153-libvlc-4-migration.md` before bumping, and run
+ * `:mediaplayer:jvmTest --tests "*VmemSubtitleProbeTest*"` after: it decides on a frame.
  */
 object VlcNativeInit {
 
