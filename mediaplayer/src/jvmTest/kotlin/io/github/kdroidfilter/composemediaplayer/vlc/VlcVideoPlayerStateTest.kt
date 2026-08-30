@@ -51,4 +51,50 @@ class VlcVideoPlayerStateTest {
         assertTrue(received > 3, "libVLC delivered no video frames to the render callback (got $received)")
         assertTrue(duration != "00:00", "duration never populated")
     }
+
+    /**
+     * The volume the host app asked for has to survive the media it was asked on (Okamp.tv task
+     * 184). `libvlc_audio_set_volume` has nowhere to write until the audio output of the media
+     * being started exists, so a level set before `openUri` — or carried over from the media a zap
+     * replaced — is dropped and the new one plays at libVLC's own 100 %, while [volume] keeps
+     * reporting the request. [nativeVolumePercent] is the difference, and the only thing worth
+     * asserting here.
+     *
+     * Opt-in the same way as the test above: it needs a real media and real natives.
+     */
+    @Test
+    fun keepsTheRequestedVolumeAcrossAMediaChange() {
+        val url = System.getenv("VLC_TEST_URL")?.takeIf { it.isNotBlank() } ?: run {
+            println("VLC_TEST_URL unset — skipping volume test")
+            return
+        }
+
+        val state = VlcVideoPlayerState()
+        // Set *before* anything is open, which is what the app does: the stored preference is read
+        // from the database while the player is still empty.
+        state.volume = 0.2f
+        state.openUri(url, InitialPlayerState.PLAY)
+        val onFirstOpen = state.awaitNativeVolume()
+
+        // The zap: a second openUri on the same player, with nothing touching `volume` in between.
+        state.openUri(url, InitialPlayerState.PLAY)
+        val onSecondOpen = state.awaitNativeVolume()
+        state.dispose()
+
+        assertTrue(onFirstOpen in 18..22, "first open played at $onFirstOpen% instead of 20%")
+        assertTrue(onSecondOpen in 18..22, "the media after a zap played at $onSecondOpen% instead of 20%")
+    }
+
+    /** libVLC applies the level asynchronously, once its output exists — so poll rather than read. */
+    private fun VlcVideoPlayerState.awaitNativeVolume(): Int {
+        val deadline = System.currentTimeMillis() + 30_000
+        var last = -1
+        while (System.currentTimeMillis() < deadline) {
+            last = nativeVolumePercent
+            if (isPlaying && last in 18..22) return last
+            if (error != null) break
+            Thread.sleep(100)
+        }
+        return last
+    }
 }

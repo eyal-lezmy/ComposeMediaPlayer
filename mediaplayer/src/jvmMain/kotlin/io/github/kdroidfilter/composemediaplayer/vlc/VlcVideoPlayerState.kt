@@ -226,8 +226,29 @@ class VlcVideoPlayerState(
         set(value) {
             val v = value.coerceIn(0f, 1f)
             _volume.value = v
-            ioScope.launch { player.audio().setVolume((v * 100).toInt()) }
+            pushVolume()
         }
+
+    /**
+     * Puts [_volume] on libVLC's audio output.
+     *
+     * Called on every assignment **and again once the new media is actually running**, because
+     * `libvlc_audio_set_volume` has nowhere to write until the audio output of that media exists:
+     * before then it fails and the value is simply lost, and the media starts at libVLC's own
+     * 100 %. That is the whole of the "the slider shows 20 %, the sound is full" bug — the host
+     * app's volume is correct, it just never reached the output of the media that replaced the
+     * one it was set on (Okamp.tv task 184).
+     */
+    private fun pushVolume() {
+        ioScope.launch { player.audio().setVolume((_volume.value * 100).toInt()) }
+    }
+
+    /**
+     * What libVLC's audio output is *actually* at, in percent, or `-1` when it has none to answer
+     * for. The only way to tell a level that was requested from one that was applied — [volume]
+     * reports the request and says nothing about whether it survived the media it was set on.
+     */
+    internal val nativeVolumePercent: Int get() = player.audio().volume()
 
     private val _speed = mutableStateOf(1f)
     override var playbackSpeed: Float
@@ -355,8 +376,15 @@ class VlcVideoPlayerState(
         player.events().addMediaPlayerEventListener(object : MediaPlayerEventAdapter() {
             override fun playing(mp: MediaPlayer) = onUi {
                 hasMedia = true; isPlaying = true; isLoading = false; error = null
+                // The output of *this* media exists only now — see pushVolume.
+                pushVolume()
                 refreshTracks()
             }
+            // vlcj's own "the player will accept API calls now" signal, fired once per media a beat
+            // after `playing`. The volume is pushed twice on purpose: `playing` is what makes the
+            // sound audible, and this is the callback vlcj documents as the safe one, so a backend
+            // that creates its output late is still covered.
+            override fun mediaPlayerReady(mp: MediaPlayer) = pushVolume()
             // The elementary streams of an HLS feed are announced one by one, after `playing` — the
             // second audio rendition of a bilingual channel typically lands a beat later.
             override fun elementaryStreamAdded(mp: MediaPlayer, type: TrackType, id: Int) = refreshTracks()
@@ -581,6 +609,8 @@ class VlcVideoPlayerState(
         _durationText.value = formatTime(0.0)
         startStatsSampling()
         ioScope.launch {
+            // Best effort: it sticks when an output is still up from the previous media, and is
+            // dropped otherwise — the `playing` event is what actually carries the level over.
             player.audio().setVolume((_volume.value * 100).toInt())
             val ok = player.media().play(uri, *mediaOptionsFor(uri))
             if (!ok) onUi { isLoading = false; error = VideoPlayerError.SourceError("Failed to open: $uri") }
