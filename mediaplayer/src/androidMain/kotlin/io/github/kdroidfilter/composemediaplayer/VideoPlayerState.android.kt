@@ -1,9 +1,6 @@
 package io.github.kdroidfilter.composemediaplayer
 
-import android.content.BroadcastReceiver
 import android.content.Context
-import android.content.Intent
-import android.content.IntentFilter
 import android.net.Uri
 import androidx.annotation.OptIn
 import androidx.compose.runtime.Stable
@@ -77,6 +74,17 @@ internal val androidVideoLogger = buildLocalLogger("AndroidVideoPlayerSurface")
 open class DefaultVideoPlayerState: VideoPlayerState {
     private val context: Context = ContextProvider.getContext()
     internal var exoPlayer: ExoPlayer? = null
+
+    /**
+     * The backend's own [Player], so a host app can hand it to a media3 `MediaSession` instead of
+     * writing a `Player` adapter over this state. Null before the player is built and after it is
+     * released.
+     *
+     * Deliberately not a member of the common [VideoPlayerState] interface: `Player` is an Android
+     * type, and the six other backends have nothing to return. Read it from `androidMain`, where
+     * this concrete class is visible.
+     */
+    val player: Player? get() = exoPlayer
     private var updateJob: Job? = null
     private val coroutineScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     private val audioProcessor = AudioLevelProcessor()
@@ -85,10 +93,6 @@ open class DefaultVideoPlayerState: VideoPlayerState {
     private var isPlayerReleased = false
     private val playerInitializationLock = Any()
     private var playerListener: Player.Listener? = null
-
-    // Screen lock detection
-    private var screenLockReceiver: BroadcastReceiver? = null
-    private var wasPlayingBeforeScreenLock: Boolean = false
 
     private var _hasMedia by mutableStateOf(false)
     override val hasMedia: Boolean get() = _hasMedia
@@ -350,7 +354,6 @@ open class DefaultVideoPlayerState: VideoPlayerState {
             _rightLevel = right
         }
         initializePlayer()
-        registerScreenLockReceiver()
     }
 
     private fun shouldUseConservativeCodecHandling(): Boolean {
@@ -368,71 +371,6 @@ open class DefaultVideoPlayerState: VideoPlayerState {
         return device in problematicDevices ||
                 model in problematicDevices ||
                 manufacturer.equals("mediatek", ignoreCase = true)
-    }
-
-    private fun registerScreenLockReceiver() {
-        unregisterScreenLockReceiver()
-
-        screenLockReceiver = object : BroadcastReceiver() {
-            override fun onReceive(context: Context?, intent: Intent?) {
-                when (intent?.action) {
-                    Intent.ACTION_SCREEN_OFF -> {
-                        androidVideoLogger.d { "Screen turned off (locked)" }
-                        synchronized(playerInitializationLock) {
-                            if (!isPlayerReleased && exoPlayer != null) {
-                                wasPlayingBeforeScreenLock = _isPlaying
-                                if (_isPlaying) {
-                                    try {
-                                        androidVideoLogger.d { "Pausing playback due to screen lock" }
-                                        exoPlayer?.pause()
-                                    } catch (e: Exception) {
-                                        androidVideoLogger.e { "Error pausing on screen lock: ${e.message}" }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Intent.ACTION_SCREEN_ON -> {
-                        androidVideoLogger.d { "Screen turned on (unlocked)" }
-                        synchronized(playerInitializationLock) {
-                            if (!isPlayerReleased && wasPlayingBeforeScreenLock && exoPlayer != null) {
-                                try {
-                                    // Ajouter un petit délai pour s'assurer que le système est prêt
-                                    coroutineScope.launch {
-                                        delay(200)
-                                        if (!isPlayerReleased) {
-                                            androidVideoLogger.d { "Resuming playback after screen unlock" }
-                                            exoPlayer?.play()
-                                        }
-                                    }
-                                } catch (e: Exception) {
-                                    androidVideoLogger.e { "Error resuming after screen unlock: ${e.message}" }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        val filter = IntentFilter().apply {
-            addAction(Intent.ACTION_SCREEN_OFF)
-            addAction(Intent.ACTION_SCREEN_ON)
-        }
-        context.registerReceiver(screenLockReceiver, filter)
-        androidVideoLogger.d { "Screen lock receiver registered" }
-    }
-
-    private fun unregisterScreenLockReceiver() {
-        screenLockReceiver?.let {
-            try {
-                context.unregisterReceiver(it)
-                androidVideoLogger.d { "Screen lock receiver unregistered" }
-            } catch (e: Exception) {
-                androidVideoLogger.e { "Error unregistering screen lock receiver: ${e.message}" }
-            }
-            screenLockReceiver = null
-        }
     }
 
     private fun initializePlayer() {
@@ -465,7 +403,20 @@ open class DefaultVideoPlayerState: VideoPlayerState {
             exoPlayer = ExoPlayer.Builder(context)
                 .setRenderersFactory(renderersFactory)
                 .setHandleAudioBecomingNoisy(true)
-                .setWakeMode(C.WAKE_MODE_LOCAL)
+                // Audio focus is handled by the player, not by the host app: an incoming call, a
+                // navigation prompt or another media app ducks or pauses us and playback comes back
+                // afterwards. Mandatory once playback can continue with the screen off — otherwise
+                // the stream talks over the call.
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(C.USAGE_MEDIA)
+                        .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
+                        .build(),
+                    /* handleAudioFocus = */ true,
+                )
+                // NETWORK rather than LOCAL: a background stream also needs the WifiLock, or the
+                // radio idles the socket out from under it once the screen is off.
+                .setWakeMode(C.WAKE_MODE_NETWORK)
                 .setPauseAtEndOfMediaItems(false)
                 .setReleaseTimeoutMs(2000) // Augmenter le timeout de libération
                 .build()
@@ -850,7 +801,6 @@ open class DefaultVideoPlayerState: VideoPlayerState {
 
             playerListener = null
             exoPlayer = null
-            unregisterScreenLockReceiver()
             resetStates()
         }
     }
